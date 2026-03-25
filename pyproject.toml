@@ -1,0 +1,97 @@
+[build-system]
+requires = ["maturin>=1.2,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rtls"
+description = "A drop-in replacement for Python's ssl module, backed by rustls"
+readme = "README.md"
+requires-python = ">=3.7"
+license = { file = "LICENSE" }
+authors = [
+  {name = "Ahmed R. TAHRI", email="tahri.ahmed@proton.me"},
+]
+maintainers = [
+  {name = "Ahmed R. TAHRI", email="tahri.ahmed@proton.me"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Programming Language :: Python :: Free Threading :: 4 - Resilient",
+]
+dynamic = [
+    'version'
+]
+dependencies = [
+  "wassima>=1,<3",
+]
+
+[tool.maturin]
+include = [
+  { path = "NOTICE", format = "sdist" },
+  { path = "tests/**/*", format = "sdist" },
+]
+exclude = [
+  { path = "**/__pycache__/**", format = "sdist" },
+]
+features = ["pyo3/extension-module", "pyo3/abi3-py37", "pyo3/generate-import-lib"]
+module-name = "rtls._rustls"
+python-source = "src"
+manifest-path = "rust/Cargo.toml"
+
+[tool.maturin.sbom]
+# Generate a CycloneDX SBOM for the Rust dependency tree.
+# Defaults to true when the sbom feature is enabled.
+rust = true
+# Generate a CycloneDX SBOM for external shared libraries grafted during
+# auditwheel repair. Defaults to true when repair copies libraries.
+auditwheel = true
+
+[project.urls]
+homepage = "https://github.com/jawah/rtls"
+
+[tool.pytest.ini_options]
+xfail_strict = true
+log_level = "DEBUG"
+filterwarnings = [
+    "error",
+    '''ignore:Exception ignored in:pytest.PytestUnraisableExceptionWarning''',
+    '''ignore:Exception in thread:pytest.PytestUnhandledThreadExceptionWarning''',
+    '''ignore:Unverified HTTPS request is being made to host:urllib3.exceptions.InsecureRequestWarning''',
+    '''ignore:Exception ignored while finalizing socket:pytest.PytestUnraisableExceptionWarning''',
+]
+
+[tool.mypy]
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+ignore_missing_imports = true
+strict_optional = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle
+    "F",  # Pyflakes
+    "W",  # pycodestyle
+    "I",  # isort
+    "U",  # pyupgrade
+]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]

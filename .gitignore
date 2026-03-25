@@ -1,0 +1,25 @@
+*.egg-info
+*.pyc
+*.so
+.coverage
+.eggs
+.mypy_cache
+.vscode
+.idea
+bob.bin
+/build
+/dist
+/docs/_build
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+target/
+.nox
+
+.coverage.*
