@@ -4,8 +4,41 @@ use rustls::crypto::aws_lc_rs as provider;
 use rustls::crypto::SupportedKxGroup;
 use rustls::pki_types::{CertificateDer, EchConfigListBytes, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedCipherSuite};
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::sync::Arc;
+
+/// Custom KeyLog implementation that writes to a specific file path,
+/// matching stdlib ssl's `SSLContext.keylog_filename` behavior.
+/// Unlike rustls's built-in `KeyLogFile` which reads from `$SSLKEYLOGFILE`,
+/// this writes to whatever path the user set via `ctx.keylog_filename`.
+#[derive(Debug)]
+struct KeyLogToFile {
+    path: std::path::PathBuf,
+}
+
+impl KeyLogToFile {
+    fn new(path: String) -> Self {
+        Self {
+            path: std::path::PathBuf::from(path),
+        }
+    }
+}
+
+impl rustls::KeyLog for KeyLogToFile {
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let cr_hex: String = client_random.iter().map(|b| format!("{:02x}", b)).collect();
+        let secret_hex: String = secret.iter().map(|b| format!("{:02x}", b)).collect();
+        let _ = writeln!(file, "{} {} {}", label, cr_hex, secret_hex);
+    }
+}
 
 /// Preferred cipher suite order.
 ///
@@ -528,8 +561,8 @@ impl RustlsConfigBuilder {
             config.alpn_protocols = self.alpn_protocols.clone();
         }
 
-        if self.keylog_filename.is_some() {
-            config.key_log = Arc::new(rustls::KeyLogFile::new());
+        if let Some(ref path) = self.keylog_filename {
+            config.key_log = Arc::new(KeyLogToFile::new(path.clone()));
         }
 
         config.enable_sni = self.sni_enabled;
@@ -567,8 +600,8 @@ impl RustlsConfigBuilder {
             config.alpn_protocols = self.alpn_protocols.clone();
         }
 
-        if self.keylog_filename.is_some() {
-            config.key_log = Arc::new(rustls::KeyLogFile::new());
+        if let Some(ref path) = self.keylog_filename {
+            config.key_log = Arc::new(KeyLogToFile::new(path.clone()));
         }
 
         Ok(config)

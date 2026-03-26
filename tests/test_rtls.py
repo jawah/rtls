@@ -3380,6 +3380,65 @@ class TestStdlibInterop(unittest.TestCase):
         self.assertEqual(result.get("server"), "ok")
         self.assertEqual(h.hexdigest(), result["digest"])
 
+    def test_keylog_filename_writes_secrets(self):
+        """keylog_filename writes TLS secrets without $SSLKEYLOGFILE env var."""
+        import tempfile
+
+        server_ctx = self._make_stdlib_server_ctx()
+        server_sock, t, port, result = self._start_server(server_ctx)
+
+        # Create a temp file for keylog output
+        fd, keylog_path = tempfile.mkstemp(suffix=".log")
+        os.close(fd)
+        os.unlink(keylog_path)  # ensure it doesn't exist yet
+
+        try:
+            client_ctx = self._make_rtls_client_ctx()
+            client_ctx.keylog_filename = keylog_path
+
+            with client_ctx.wrap_socket(
+                socket.socket(), server_hostname="localhost"
+            ) as s:
+                s.connect(("127.0.0.1", port))
+                s.sendall(b"hello")
+                data = s.recv(1024)
+                self.assertEqual(data, b"hello")
+
+            # Verify keylog file was created and contains valid entries
+            self.assertTrue(
+                os.path.exists(keylog_path),
+                "keylog file was not created",
+            )
+            with open(keylog_path) as f:
+                content = f.read()
+
+            self.assertGreater(len(content), 0, "keylog file is empty")
+
+            # NSS Key Log format: each line is "LABEL <client_random_hex> <secret_hex>"
+            lines = [l for l in content.strip().splitlines() if l]
+            for line in lines:
+                parts = line.split(" ")
+                self.assertEqual(len(parts), 3, f"malformed keylog line: {line!r}")
+                label, client_random, secret = parts
+                # client_random and secret must be hex strings
+                self.assertTrue(
+                    all(c in "0123456789abcdef" for c in client_random),
+                    f"non-hex client_random: {client_random!r}",
+                )
+                self.assertTrue(
+                    all(c in "0123456789abcdef" for c in secret),
+                    f"non-hex secret: {secret!r}",
+                )
+
+            # Must contain at least CLIENT_TRAFFIC_SECRET_0
+            labels = {l.split(" ")[0] for l in lines}
+            self.assertIn("CLIENT_TRAFFIC_SECRET_0", labels)
+        finally:
+            server_sock.close()
+            t.join(timeout=10)
+            if os.path.exists(keylog_path):
+                os.unlink(keylog_path)
+
 
 if __name__ == "__main__":
     unittest.main()
