@@ -101,7 +101,7 @@ You do not need to constraint the upper bound version.
 I saw https://github.com/djc/pyrtls a couple of months ago, and it inspired me to write this alternative.
 Why? As you are aware, we are maintaining a fork of urllib3 and requests, and having to handwrite a support for a non ssl
 compatible lib is going to be a nightmare. We just can't ask the maintainer to rewrite everything for our
-own sake.
+own needs.
 
 ### Documentation
 
