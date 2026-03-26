@@ -57,8 +57,8 @@ class TLSContext(_stdlib_ssl.SSLContext):
         self._verify_mode = CERT_NONE
         self._check_hostname = False
         self._options = OP_ALL | OP_NO_SSLv2 | OP_NO_SSLv3
-        self._minimum_version: TLSVersion | None = None
-        self._maximum_version: TLSVersion | None = None
+        self._minimum_version: TLSVersion | None = TLSVersion.TLSv1_2
+        self._maximum_version: TLSVersion | None = TLSVersion.TLSv1_3
         self._alpn_protocols: list[bytes] = []
         self._ciphers_string: str | None = None
         self._sni_callback: Callable | None = None
@@ -319,7 +319,7 @@ class TLSContext(_stdlib_ssl.SSLContext):
     @maximum_version.setter
     def maximum_version(self, value: TLSVersion | int | None) -> None:
         if value is None or value == TLSVersion.MAXIMUM_SUPPORTED:
-            self._maximum_version = None
+            self._maximum_version = TLSVersion.TLSv1_3
             self._builder.set_max_version(0x0304)  # TLS 1.3
         else:
             value = TLSVersion(value)
