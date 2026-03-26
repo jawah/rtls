@@ -1362,6 +1362,248 @@ class TestEncryptedKeySupport(unittest.TestCase):
         self.assertTrue(ctx._cert_chain_loaded)
 
 
+class TestTraditionalEncryptedKeySupport(unittest.TestCase):
+    """Test loading traditional OpenSSL encrypted PEM keys (Proc-Type/DEK-Info)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Generate test fixtures: self-signed cert + traditional encrypted keys."""
+        import subprocess
+        import tempfile
+
+        cls._tmpdir = tempfile.mkdtemp(prefix="rtls_trad_enc_")
+        cls.password = b"letmein"
+
+        # Generate plaintext EC key (SEC1 format, P-256)
+        cls.ec_key_plain = os.path.join(cls._tmpdir, "ec_key_plain.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "ecparam",
+                "-genkey",
+                "-name",
+                "prime256v1",
+                "-out",
+                cls.ec_key_plain,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        # Traditional encrypted EC key with AES-256-CBC
+        cls.ec_key_enc_aes256 = os.path.join(cls._tmpdir, "ec_key_enc_aes256.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "ec",
+                "-in",
+                cls.ec_key_plain,
+                "-out",
+                cls.ec_key_enc_aes256,
+                "-aes-256-cbc",
+                "-passout",
+                f"pass:{cls.password.decode()}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        # Traditional encrypted EC key with AES-128-CBC
+        cls.ec_key_enc_aes128 = os.path.join(cls._tmpdir, "ec_key_enc_aes128.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "ec",
+                "-in",
+                cls.ec_key_plain,
+                "-out",
+                cls.ec_key_enc_aes128,
+                "-aes-128-cbc",
+                "-passout",
+                f"pass:{cls.password.decode()}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        # Traditional encrypted EC key with DES-EDE3-CBC
+        cls.ec_key_enc_3des = os.path.join(cls._tmpdir, "ec_key_enc_3des.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "ec",
+                "-in",
+                cls.ec_key_plain,
+                "-out",
+                cls.ec_key_enc_3des,
+                "-des3",
+                "-passout",
+                f"pass:{cls.password.decode()}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        # Generate plaintext RSA key (PKCS#1 format)
+        cls.rsa_key_plain = os.path.join(cls._tmpdir, "rsa_key_plain.pem")
+        subprocess.run(
+            ["openssl", "genrsa", "-out", cls.rsa_key_plain, "2048"],
+            check=True,
+            capture_output=True,
+        )
+
+        # Traditional encrypted RSA key with AES-256-CBC
+        cls.rsa_key_enc_aes256 = os.path.join(cls._tmpdir, "rsa_key_enc_aes256.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "rsa",
+                "-in",
+                cls.rsa_key_plain,
+                "-out",
+                cls.rsa_key_enc_aes256,
+                "-aes-256-cbc",
+                "-passout",
+                f"pass:{cls.password.decode()}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        # Self-signed cert from EC key
+        cls.ec_cert = os.path.join(cls._tmpdir, "ec_cert.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-x509",
+                "-key",
+                cls.ec_key_plain,
+                "-out",
+                cls.ec_cert,
+                "-days",
+                "365",
+                "-subj",
+                "/CN=test-trad-enc.example.com",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        # Self-signed cert from RSA key
+        cls.rsa_cert = os.path.join(cls._tmpdir, "rsa_cert.pem")
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-x509",
+                "-key",
+                cls.rsa_key_plain,
+                "-out",
+                cls.rsa_cert,
+                "-days",
+                "365",
+                "-subj",
+                "/CN=test-trad-enc-rsa.example.com",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def test_load_ec_traditional_aes256(self):
+        """Traditional AES-256-CBC encrypted EC key."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_cert_chain(
+            certfile=self.ec_cert,
+            keyfile=self.ec_key_enc_aes256,
+            password=self.password,
+        )
+        self.assertTrue(ctx._cert_chain_loaded)
+
+    def test_load_ec_traditional_aes128(self):
+        """Traditional AES-128-CBC encrypted EC key."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_cert_chain(
+            certfile=self.ec_cert,
+            keyfile=self.ec_key_enc_aes128,
+            password=self.password,
+        )
+        self.assertTrue(ctx._cert_chain_loaded)
+
+    def test_load_ec_traditional_3des(self):
+        """Traditional DES-EDE3-CBC encrypted EC key."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_cert_chain(
+            certfile=self.ec_cert,
+            keyfile=self.ec_key_enc_3des,
+            password=self.password,
+        )
+        self.assertTrue(ctx._cert_chain_loaded)
+
+    def test_load_rsa_traditional_aes256(self):
+        """Traditional AES-256-CBC encrypted RSA key."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_cert_chain(
+            certfile=self.rsa_cert,
+            keyfile=self.rsa_key_enc_aes256,
+            password=self.password,
+        )
+        self.assertTrue(ctx._cert_chain_loaded)
+
+    def test_load_traditional_wrong_password(self):
+        """Wrong password should raise an error."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        with self.assertRaises(Exception):
+            ctx.load_cert_chain(
+                certfile=self.ec_cert,
+                keyfile=self.ec_key_enc_aes256,
+                password=b"wrongpassword",
+            )
+
+    def test_load_traditional_no_password(self):
+        """Encrypted key without password should raise an error."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        with self.assertRaises(Exception):
+            ctx.load_cert_chain(
+                certfile=self.ec_cert,
+                keyfile=self.ec_key_enc_aes256,
+                password=None,
+            )
+
+    def test_load_traditional_in_memory(self):
+        """Traditional encrypted key from in-memory bytes."""
+        with open(self.ec_cert, "rb") as f:
+            cert_data = f.read()
+        with open(self.ec_key_enc_aes256, "rb") as f:
+            key_data = f.read()
+
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_cert_chain(
+            certfile=cert_data,
+            keyfile=key_data,
+            password=self.password,
+        )
+        self.assertTrue(ctx._cert_chain_loaded)
+
+    def test_load_traditional_server_side(self):
+        """Traditional encrypted key for server-side TLS context."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(
+            certfile=self.ec_cert,
+            keyfile=self.ec_key_enc_aes256,
+            password=self.password,
+        )
+        self.assertTrue(ctx._cert_chain_loaded)
+
+
 class TestIntermediateCertChainBuilding(unittest.TestCase):
     """Test that intermediates loaded via load_verify_locations() are used
     during chain building, matching OpenSSL's behavior.
@@ -1884,13 +2126,13 @@ class TestCovContext(unittest.TestCase):
         """Lines 328-329: minimum_version=MINIMUM_SUPPORTED."""
         ctx = _make_ctx()
         ctx.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
-        self.assertIsNone(ctx.minimum_version)
+        self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_2)
 
     def test_min_version_none(self):
         """Lines 328-329: minimum_version=None."""
         ctx = _make_ctx()
         ctx.minimum_version = None
-        self.assertIsNone(ctx.minimum_version)
+        self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_2)
 
     def test_min_version_clamp_below_tls12(self):
         """Line 334: setting min_version < TLS 1.2 clamps to TLS 1.2."""
@@ -1902,13 +2144,13 @@ class TestCovContext(unittest.TestCase):
         """Lines 345-346: maximum_version=MAXIMUM_SUPPORTED."""
         ctx = _make_ctx()
         ctx.maximum_version = ssl.TLSVersion.MAXIMUM_SUPPORTED
-        self.assertIsNone(ctx.maximum_version)
+        self.assertEqual(ctx.maximum_version, ssl.TLSVersion.TLSv1_3)
 
     def test_max_version_none(self):
         """Lines 345-346: maximum_version=None."""
         ctx = _make_ctx()
         ctx.maximum_version = None
-        self.assertIsNone(ctx.maximum_version)
+        self.assertEqual(ctx.maximum_version, ssl.TLSVersion.TLSv1_3)
 
     def test_keylog_filename_getter(self):
         """Line 363: keylog_filename getter."""

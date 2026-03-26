@@ -302,7 +302,7 @@ class TLSContext(_stdlib_ssl.SSLContext):
     @minimum_version.setter
     def minimum_version(self, value: TLSVersion | int | None) -> None:
         if value is None or value == TLSVersion.MINIMUM_SUPPORTED:
-            self._minimum_version = None
+            self._minimum_version = TLSVersion.TLSv1_2
             self._builder.set_min_version(0x0303)  # TLS 1.2 is our min
         else:
             value = TLSVersion(value)

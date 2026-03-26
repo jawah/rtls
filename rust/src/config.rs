@@ -609,15 +609,19 @@ impl RustlsConfigBuilder {
 }
 
 /// Load a private key from PEM data. Tries PKCS#8, then RSA PKCS#1, then SEC1 (EC).
-/// If the PEM contains an ENCRYPTED PRIVATE KEY (PKCS#8 encrypted), the password
-/// is used to decrypt it. Supports PBES2 with AES-128/256-CBC and 3DES.
+///
+/// Handles three encrypted key formats:
+/// 1. PKCS#8 encrypted (`BEGIN ENCRYPTED PRIVATE KEY`) — decrypted via the `pkcs8` crate.
+/// 2. Traditional OpenSSL encrypted (`Proc-Type: 4,ENCRYPTED` + `DEK-Info`) — decrypted
+///    using EVP_BytesToKey-style key derivation with AES-128/256-CBC, DES-EDE3-CBC, or DES-CBC.
+/// 3. Plaintext PEM keys — parsed directly via `rustls_pemfile`.
+///
 /// Pure Rust — no GIL needed (called from within allow_threads blocks).
 fn load_private_key(
     pem_data: &[u8],
     password: Option<&[u8]>,
 ) -> Result<PrivateKeyDer<'static>, String> {
-    // First check for ENCRYPTED PRIVATE KEY blocks.
-    // rustls_pemfile doesn't handle these, so we use the pkcs8 crate.
+    // Case 1: PKCS#8 encrypted key (BEGIN ENCRYPTED PRIVATE KEY).
     if pem_data
         .windows(b"ENCRYPTED PRIVATE KEY".len())
         .any(|w| w == b"ENCRYPTED PRIVATE KEY")
@@ -625,9 +629,6 @@ fn load_private_key(
         let password = password
             .ok_or_else(|| "Private key is encrypted but no password was provided".to_string())?;
 
-        // Extract just the encrypted key PEM section.
-        // The PEM may contain other sections (certificates), so we need to
-        // find the ENCRYPTED PRIVATE KEY block specifically.
         let pem_str = std::str::from_utf8(pem_data)
             .map_err(|e| format!("PEM data is not valid UTF-8: {}", e))?;
 
@@ -642,11 +643,9 @@ fn load_private_key(
             .ok_or_else(|| "Could not find end of ENCRYPTED PRIVATE KEY block".to_string())?;
         let key_pem = &pem_str[start..start + end + end_marker.len()];
 
-        // Decode PEM → DER using pem-rfc7468
         let (_, der_bytes) = pem_rfc7468::decode_vec(key_pem.as_bytes())
             .map_err(|e| format!("Failed to decode encrypted key PEM: {}", e))?;
 
-        // Parse the DER as EncryptedPrivateKeyInfo and decrypt
         let enc_pk_info = pkcs8::EncryptedPrivateKeyInfo::try_from(der_bytes.as_slice())
             .map_err(|e| format!("Failed to parse encrypted PKCS#8 DER: {}", e))?;
 
@@ -661,7 +660,40 @@ fn load_private_key(
         ));
     }
 
-    // Fall through to plaintext key parsing via rustls_pemfile
+    // Case 2: Traditional OpenSSL encrypted PEM (Proc-Type: 4,ENCRYPTED + DEK-Info header).
+    // rustls_pemfile cannot parse these because the Proc-Type/DEK-Info headers
+    // contain characters that break strict RFC 7468 base64 parsing.
+    if pem_data
+        .windows(b"Proc-Type: 4,ENCRYPTED".len())
+        .any(|w| w == b"Proc-Type: 4,ENCRYPTED")
+    {
+        let password = password
+            .ok_or_else(|| "Private key is encrypted but no password was provided".to_string())?;
+
+        let decrypted_der = decrypt_traditional_pem(pem_data, password)?;
+
+        // Determine the key type from the PEM header.
+        let pem_str = std::str::from_utf8(pem_data)
+            .map_err(|e| format!("PEM data is not valid UTF-8: {}", e))?;
+
+        if pem_str.contains("BEGIN RSA PRIVATE KEY") {
+            return Ok(PrivateKeyDer::Pkcs1(
+                rustls::pki_types::PrivatePkcs1KeyDer::from(decrypted_der),
+            ));
+        } else if pem_str.contains("BEGIN EC PRIVATE KEY") {
+            return Ok(PrivateKeyDer::Sec1(
+                rustls::pki_types::PrivateSec1KeyDer::from(decrypted_der),
+            ));
+        } else if pem_str.contains("BEGIN PRIVATE KEY") {
+            return Ok(PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(decrypted_der),
+            ));
+        }
+
+        return Err("Unrecognized traditional encrypted PEM key type".to_string());
+    }
+
+    // Case 3: Plaintext PEM key — parsed by rustls_pemfile.
     let mut reader = BufReader::new(pem_data);
 
     loop {
@@ -687,4 +719,181 @@ fn load_private_key(
     }
 
     Err("No private key found in PEM data".to_string())
+}
+
+/// Decrypt a traditional OpenSSL encrypted PEM key.
+///
+/// Format:
+/// ```text
+/// -----BEGIN <TYPE> PRIVATE KEY-----
+/// Proc-Type: 4,ENCRYPTED
+/// DEK-Info: <CIPHER>,<IV-HEX>
+///
+/// <base64 encrypted body>
+/// -----END <TYPE> PRIVATE KEY-----
+/// ```
+///
+/// Key derivation uses OpenSSL's `EVP_BytesToKey` (MD5-based):
+///   key = MD5(password || IV[:8]) [|| MD5(prev || password || IV[:8])] ...
+///
+/// Supported ciphers: AES-128-CBC, AES-256-CBC, DES-EDE3-CBC, DES-CBC.
+fn decrypt_traditional_pem(pem_data: &[u8], password: &[u8]) -> Result<Vec<u8>, String> {
+    use base64ct::{Base64, Encoding};
+    use cipher::BlockDecryptMut;
+    use cipher::KeyIvInit;
+
+    let pem_str =
+        std::str::from_utf8(pem_data).map_err(|e| format!("PEM is not valid UTF-8: {}", e))?;
+
+    // Parse DEK-Info header to get cipher name and IV hex.
+    let dek_line = pem_str
+        .lines()
+        .find(|l| l.starts_with("DEK-Info:"))
+        .ok_or_else(|| "No DEK-Info header in encrypted PEM".to_string())?;
+
+    let dek_value = dek_line
+        .strip_prefix("DEK-Info:")
+        .ok_or_else(|| "Malformed DEK-Info".to_string())?
+        .trim();
+
+    let (cipher_name, iv_hex) = dek_value
+        .split_once(',')
+        .ok_or_else(|| "Malformed DEK-Info: expected CIPHER,IV".to_string())?;
+
+    let iv = hex_decode(iv_hex.trim())?;
+
+    // Extract the base64 body: everything between the blank line after headers
+    // and the END marker.
+    let body_b64 = extract_pem_body(pem_str)?;
+    let encrypted = Base64::decode_vec(&body_b64)
+        .map_err(|e| format!("Failed to base64-decode encrypted key body: {}", e))?;
+
+    // Derive key using EVP_BytesToKey (MD5-based, single iteration, no salt param —
+    // the IV[:8] serves as the salt).
+    let salt = &iv[..8];
+
+    match cipher_name.trim() {
+        "AES-128-CBC" => {
+            let key = evp_bytes_to_key::<16>(password, salt);
+            let mut buf = encrypted;
+            let pt = cbc::Decryptor::<aes::Aes128>::new_from_slices(&key, &iv)
+                .map_err(|e| format!("AES-128-CBC init error: {}", e))?
+                .decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut buf)
+                .map_err(|e| format!("AES-128-CBC decrypt error: {}", e))?;
+            Ok(pt.to_vec())
+        }
+        "AES-256-CBC" => {
+            let key = evp_bytes_to_key::<32>(password, salt);
+            let mut buf = encrypted;
+            let pt = cbc::Decryptor::<aes::Aes256>::new_from_slices(&key, &iv)
+                .map_err(|e| format!("AES-256-CBC init error: {}", e))?
+                .decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut buf)
+                .map_err(|e| format!("AES-256-CBC decrypt error: {}", e))?;
+            Ok(pt.to_vec())
+        }
+        "DES-EDE3-CBC" => {
+            let key = evp_bytes_to_key::<24>(password, salt);
+            let mut buf = encrypted;
+            let pt = cbc::Decryptor::<des::TdesEde3>::new_from_slices(&key, &iv)
+                .map_err(|e| format!("DES-EDE3-CBC init error: {}", e))?
+                .decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut buf)
+                .map_err(|e| format!("DES-EDE3-CBC decrypt error: {}", e))?;
+            Ok(pt.to_vec())
+        }
+        "DES-CBC" => {
+            let key = evp_bytes_to_key::<8>(password, salt);
+            let mut buf = encrypted;
+            let pt = cbc::Decryptor::<des::Des>::new_from_slices(&key, &iv)
+                .map_err(|e| format!("DES-CBC init error: {}", e))?
+                .decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut buf)
+                .map_err(|e| format!("DES-CBC decrypt error: {}", e))?;
+            Ok(pt.to_vec())
+        }
+        other => Err(format!(
+            "Unsupported traditional PEM cipher: {}. \
+             Supported: AES-128-CBC, AES-256-CBC, DES-EDE3-CBC, DES-CBC",
+            other
+        )),
+    }
+}
+
+/// OpenSSL `EVP_BytesToKey` key derivation (MD5, 1 iteration, no count).
+///
+/// Produces `KEY_LEN` bytes by repeatedly hashing:
+///   D_0 = ""
+///   D_i = MD5(D_{i-1} || password || salt)
+///   key = D_1 || D_2 || ... truncated to KEY_LEN
+fn evp_bytes_to_key<const KEY_LEN: usize>(password: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
+    use md5::{Digest, Md5};
+
+    let mut key = [0u8; KEY_LEN];
+    let mut prev_hash: Vec<u8> = Vec::new();
+    let mut offset = 0;
+
+    while offset < KEY_LEN {
+        let mut hasher = Md5::new();
+        if !prev_hash.is_empty() {
+            hasher.update(&prev_hash);
+        }
+        hasher.update(password);
+        hasher.update(salt);
+        prev_hash = hasher.finalize().to_vec();
+
+        let copy_len = std::cmp::min(prev_hash.len(), KEY_LEN - offset);
+        key[offset..offset + copy_len].copy_from_slice(&prev_hash[..copy_len]);
+        offset += copy_len;
+    }
+
+    key
+}
+
+/// Decode a hex string into bytes.
+fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("Odd-length hex string in DEK-Info IV".to_string());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("Invalid hex in DEK-Info IV: {}", e))
+        })
+        .collect()
+}
+
+/// Extract the base64 body from a traditional encrypted PEM.
+///
+/// Skips the BEGIN line, Proc-Type, DEK-Info, and blank line,
+/// then collects everything up to the END line.
+fn extract_pem_body(pem_str: &str) -> Result<String, String> {
+    let mut in_body = false;
+    let mut body = String::new();
+    let mut found_headers = false;
+
+    for line in pem_str.lines() {
+        if line.starts_with("-----BEGIN ") && line.ends_with("-----") {
+            found_headers = false;
+            continue;
+        }
+        if line.starts_with("-----END ") && line.ends_with("-----") {
+            break;
+        }
+        if line.starts_with("Proc-Type:") || line.starts_with("DEK-Info:") {
+            found_headers = true;
+            continue;
+        }
+        // Blank line after headers marks start of base64 body.
+        if found_headers && !in_body && line.trim().is_empty() {
+            in_body = true;
+            continue;
+        }
+        if in_body {
+            body.push_str(line.trim());
+        }
+    }
+
+    if body.is_empty() {
+        return Err("No base64 body found in encrypted PEM".to_string());
+    }
+    Ok(body)
 }
