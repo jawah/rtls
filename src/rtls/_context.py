@@ -347,12 +347,17 @@ class TLSContext(_stdlib_ssl.SSLContext):
 
     @property
     def hostname_checks_common_name(self) -> bool:
-        """rustls never checks CN (only SAN)."""
-        return False
+        raise AttributeError(
+            "rtls does not support hostname_checks_common_name"
+            " (rustls only checks SAN, never CN)"
+        )
 
     @hostname_checks_common_name.setter
     def hostname_checks_common_name(self, value: bool) -> None:
-        pass  # No-op: rustls only checks SAN
+        raise AttributeError(
+            "rtls does not support hostname_checks_common_name"
+            " (rustls only checks SAN, never CN)"
+        )
 
     @property  # type: ignore[override]
     def verify_flags(self) -> int:
