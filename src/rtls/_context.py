@@ -471,14 +471,16 @@ class TLSContext(_stdlib_ssl.SSLContext):
         """Translate OP_NO_* option flags into min/max version settings."""
         from ._constants import OP_NO_TLSv1_2, OP_NO_TLSv1_3
 
-        min_v = 0x0303  # TLS 1.2
-        max_v = 0x0304  # TLS 1.3
+        # Start from the explicitly set versions (or defaults)
+        min_v = int(self._minimum_version) if self._minimum_version else 0x0303
+        max_v = int(self._maximum_version) if self._maximum_version else 0x0304
 
+        # OP_NO_* can only further constrain, never loosen
         if self._options & OP_NO_TLSv1_2:
-            min_v = 0x0304
+            min_v = max(min_v, 0x0304)
 
         if self._options & OP_NO_TLSv1_3:
-            max_v = 0x0303
+            max_v = min(max_v, 0x0303)
 
         self._builder.set_min_version(min_v)
         self._builder.set_max_version(max_v)
