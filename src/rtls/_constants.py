@@ -9,9 +9,10 @@ PROTOCOL_TLS_CLIENT = 16
 PROTOCOL_TLS_SERVER = 17
 PROTOCOL_SSLv23 = PROTOCOL_TLS  # Deprecated alias
 
-# Deprecated per-version protocols — only TLS 1.2+ is supported by rustls.
-# PROTOCOL_TLSv1 and PROTOCOL_TLSv1_1 are intentionally NOT defined so that
-# ``getattr(ssl, 'PROTOCOL_TLSv1', 0)`` returns 0 (no TLS 1.0/1.1 support).
+# Deprecated per-version protocols — we define the constants for compatibility
+# but rtls only supports TLS 1.2+
+PROTOCOL_TLSv1 = 3
+PROTOCOL_TLSv1_1 = 4
 PROTOCOL_TLSv1_2 = 5
 
 
@@ -73,6 +74,11 @@ class Options(enum.IntFlag):
     OP_IGNORE_UNEXPECTED_EOF = 0x00000080
     OP_ENABLE_KTLS = 0x00000008
     OP_LEGACY_SERVER_CONNECT = 0x00000004
+
+    def __contains__(self, other: object) -> bool:
+        if isinstance(other, int):
+            return (int(self) & int(other)) == int(other)
+        return NotImplemented
 
 
 OP_ALL = Options.OP_ALL

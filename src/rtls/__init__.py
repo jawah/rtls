@@ -105,6 +105,8 @@ from ._constants import (
     # Options
     Options,
     PROTOCOL_SSLv23,
+    PROTOCOL_TLSv1,
+    PROTOCOL_TLSv1_1,
     PROTOCOL_TLSv1_2,
     # Purpose
     Purpose,
@@ -164,6 +166,8 @@ __all__ = [
     "PROTOCOL_TLS_CLIENT",
     "PROTOCOL_TLS_SERVER",
     "PROTOCOL_SSLv23",
+    "PROTOCOL_TLSv1",
+    "PROTOCOL_TLSv1_1",
     "PROTOCOL_TLSv1_2",
     "TLSVersion",
     "VerifyMode",

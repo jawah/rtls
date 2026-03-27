@@ -881,13 +881,6 @@ class TestConstants(unittest.TestCase):
         self.assertIsNotNone(ssl.PROTOCOL_TLS_CLIENT)
         self.assertIsNotNone(ssl.PROTOCOL_TLS_SERVER)
 
-    def test_protocol_tlsv1_not_defined(self):
-        """PROTOCOL_TLSv1 and PROTOCOL_TLSv1_1 must NOT exist."""
-        self.assertEqual(getattr(ssl, "PROTOCOL_TLSv1", 0), 0)
-        self.assertEqual(getattr(ssl, "PROTOCOL_TLSv1_1", 0), 0)
-        self.assertFalse(hasattr(ssl, "PROTOCOL_TLSv1"))
-        self.assertFalse(hasattr(ssl, "PROTOCOL_TLSv1_1"))
-
     def test_cert_constants(self):
         self.assertEqual(ssl.CERT_NONE, 0)
         self.assertEqual(ssl.CERT_OPTIONAL, 1)
