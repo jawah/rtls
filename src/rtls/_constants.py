@@ -9,10 +9,9 @@ PROTOCOL_TLS_CLIENT = 16
 PROTOCOL_TLS_SERVER = 17
 PROTOCOL_SSLv23 = PROTOCOL_TLS  # Deprecated alias
 
-# Deprecated per-version protocols — we define the constants for compatibility
-# but rtls only supports TLS 1.2+
-PROTOCOL_TLSv1 = 3
-PROTOCOL_TLSv1_1 = 4
+# Deprecated per-version protocols — only TLS 1.2+ is supported by rustls.
+# PROTOCOL_TLSv1 and PROTOCOL_TLSv1_1 are intentionally NOT defined so that
+# ``getattr(ssl, 'PROTOCOL_TLSv1', 0)`` returns 0 (no TLS 1.0/1.1 support).
 PROTOCOL_TLSv1_2 = 5
 
 
