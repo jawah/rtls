@@ -475,17 +475,17 @@ class TestContextProperties(unittest.TestCase):
             ctx.check_hostname = True
 
     def test_options_type(self):
-        """options property returns ssl.Options (not our custom type)."""
+        """options property returns rtls Options type."""
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         opts = ctx.options
-        self.assertIsInstance(opts, _stdlib_ssl.Options)
+        self.assertIsInstance(opts, ssl.Options)
 
     def test_options_contains(self):
         """ssl.OP_NO_TLSv1_3 in ctx.options works."""
         ctx = _make_ctx()
         ctx.options |= ssl.OP_NO_TLSv1_3
-        # After setting, the flag should be present
-        self.assertTrue(ctx.options & ssl.OP_NO_TLSv1_3)
+        # After setting, the flag should be present (using `in` operator)
+        self.assertIn(ssl.OP_NO_TLSv1_3, ctx.options)
 
     def test_minimum_version(self):
         ctx = _make_ctx()
@@ -503,9 +503,10 @@ class TestContextProperties(unittest.TestCase):
         self.assertTrue(ctx.post_handshake_auth)
 
     def test_hostname_checks_common_name(self):
-        """Always False for rustls (only checks SAN)."""
+        """Attribute not defined — rustls never checks CN (only SAN)."""
         ctx = _make_ctx()
-        self.assertFalse(ctx.hostname_checks_common_name)
+        with self.assertRaises(AttributeError):
+            ctx.hostname_checks_common_name  # noqa: B018
 
     def test_security_level(self):
         ctx = _make_ctx()
@@ -527,6 +528,21 @@ class TestContextProperties(unittest.TestCase):
         """set_ciphers with OpenSSL cipher string doesn't raise."""
         ctx = _make_ctx()
         ctx.set_ciphers("ECDHE+AESGCM:!aNULL")
+
+    def test_set_ciphers_tls12_only_still_connects(self):
+        """set_ciphers() with TLS 1.2-only string still works with ECH GREASE.
+
+        Stdlib behavior: set_ciphers() only controls TLS 1.2 suites; TLS 1.3
+        suites are always present unless TLS 1.3 is explicitly disabled.
+        """
+        ctx = _make_ctx()
+        ctx.set_ciphers("ECDHE+AESGCM")
+        ssock = _connect_tls(ctx=ctx)
+        try:
+            # TLS 1.3 should still be negotiated (TLS 1.3 suites are enforced)
+            self.assertEqual(ssock.version(), "TLSv1.3")
+        finally:
+            ssock.close()
 
     def test_get_ciphers(self):
         ctx = _make_ctx()
@@ -1889,6 +1905,53 @@ class TestIntermediateCertChainBuilding(unittest.TestCase):
                 t.join(timeout=5)
         finally:
             os.unlink(ca_bundle_path)
+
+    def test_intermediate_only_no_root_fails(self):
+        """Server sends only leaf cert. Client loads ONLY the intermediate
+        (no root CA). This must FAIL — an intermediate is not a trust anchor,
+        so the chain cannot terminate at a root CA."""
+        import threading
+
+        server_ctx = self._make_server_context(send_chain=False)
+
+        client_ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Load ONLY the intermediate — no root cert
+        client_ctx.load_verify_locations(cafile=self.INTERMEDIATE_CERT)
+
+        result = {}
+
+        def server_thread(server_sock, ready_event):
+            ready_event.set()
+            try:
+                conn, _ = server_sock.accept()
+                ssl_conn = server_ctx.wrap_socket(conn, server_side=True)
+                ssl_conn.write(b"OK")
+                ssl_conn.close()
+                result["server"] = "ok"
+            except Exception as e:
+                result["server_error"] = str(e)
+
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(("127.0.0.1", 0))
+        server_sock.listen(1)
+        port = server_sock.getsockname()[1]
+
+        ready = threading.Event()
+        t = threading.Thread(target=server_thread, args=(server_sock, ready))
+        t.daemon = True
+        t.start()
+        ready.wait()
+
+        try:
+            with self.assertRaises((ssl.SSLError, SSLCertVerificationError)):
+                with client_ctx.wrap_socket(
+                    socket.socket(), server_hostname="localhost"
+                ) as s:
+                    s.connect(("127.0.0.1", port))
+        finally:
+            server_sock.close()
+            t.join(timeout=5)
 
 
 ###############################################################################
@@ -3680,6 +3743,84 @@ class TestStdlibInterop(unittest.TestCase):
             t.join(timeout=10)
             if os.path.exists(keylog_path):
                 os.unlink(keylog_path)
+
+    def test_close_with_makefile_open(self):
+        """close() with an open makefile() must NOT destroy TLS state.
+
+        When makefile() is active, close() should only mark the socket
+        as closed. The TLS state and fd must stay alive so send/recv
+        and fileno() keep working — matching stdlib ssl.SSLSocket behavior.
+        """
+        server_ctx = self._make_stdlib_server_ctx()
+        server_sock, t, port, result = self._start_server(server_ctx)
+
+        try:
+            client_ctx = self._make_rtls_client_ctx()
+            ssl_sock = client_ctx.wrap_socket(
+                socket.socket(), server_hostname="localhost"
+            )
+            ssl_sock.connect(("127.0.0.1", port))
+
+            # Create a makefile reference — this increments _io_refs
+            f = ssl_sock.makefile("rb")
+
+            # close() should be a soft close: _closed=True but TLS alive
+            ssl_sock.close()
+            ssl_sock.close()  # second close must be idempotent
+
+            # sendall must still work (TLS state alive, fd open)
+            ssl_sock.sendall(b"hello")
+
+            # fileno must still return a valid fd
+            self.assertGreater(ssl_sock.fileno(), 0)
+
+            # Read echoed data through the makefile
+            echoed = ssl_sock.recv(1024)
+            self.assertEqual(echoed, b"hello")
+
+            # Close the makefile — this triggers _real_close()
+            f.close()
+        finally:
+            server_sock.close()
+            t.join(timeout=5)
+
+    def test_wrap_socket_failure_closes_fd(self):
+        """When wrap_socket() fails (e.g. UnknownIssuer), the underlying
+        fd must be closed — matching stdlib behavior.
+
+        Without the fix, sock.detach() transfers fd ownership to the
+        TLSSocket, but if do_handshake() raises, nobody closes the fd.
+        """
+        server_ctx = self._make_stdlib_server_ctx()
+        server_sock, t, port, result = self._start_server(server_ctx)
+
+        try:
+            # Client context with NO trusted CAs → UnknownIssuer
+            client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.connect(("127.0.0.1", port))
+            fd = raw_sock.fileno()
+            self.assertGreater(fd, 0)
+
+            with self.assertRaises(ssl.SSLError):
+                client_ctx.wrap_socket(raw_sock, server_hostname="localhost")
+
+            # After wrap_socket failure:
+            # - raw_sock was detached (fd == -1)
+            # - The fd that was taken over must now be closed
+            self.assertEqual(raw_sock.fileno(), -1)
+
+            # Verify the fd is actually closed: os.fstat raises EBADF
+            # on a closed fd.
+            import errno as _errno
+
+            with self.assertRaises(OSError) as cm:
+                os.fstat(fd)
+            self.assertEqual(cm.exception.errno, _errno.EBADF)
+        finally:
+            server_sock.close()
+            t.join(timeout=5)
 
 
 if __name__ == "__main__":

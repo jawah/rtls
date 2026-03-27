@@ -756,12 +756,11 @@ class ContextTests(unittest.TestCase):
 
     def test_hostname_checks_common_name(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        # rtls/rustls never checks CN (only SAN), so this is always False
-        self.assertFalse(ctx.hostname_checks_common_name)
-        # Setting it doesn't raise, but is a no-op
-        ctx.hostname_checks_common_name = True
-        # rustls always returns False
-        self.assertFalse(ctx.hostname_checks_common_name)
+        # rtls/rustls never checks CN (only SAN), attribute is not defined
+        with self.assertRaises(AttributeError):
+            ctx.hostname_checks_common_name  # noqa: B018
+        with self.assertRaises(AttributeError):
+            ctx.hostname_checks_common_name = True
 
     def test_min_max_version(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
