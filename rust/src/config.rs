@@ -88,16 +88,28 @@ const CERT_REQUIRED: i32 = 2;
 const TLS_V1_2: u16 = 0x0303;
 const TLS_V1_3: u16 = 0x0304;
 
+/// Check if a DER-encoded certificate is self-signed (subject == issuer).
+/// Self-signed certs are root CAs; non-self-signed certs are intermediates.
+/// If parsing fails, conservatively treats the cert as self-signed so it
+/// still gets added to the root store (safe fallback — worst case it becomes
+/// a trust anchor when it shouldn't, which is the old behavior anyway).
+fn is_self_signed(cert_der: &CertificateDer<'_>) -> bool {
+    use x509_parser::prelude::FromDer;
+    match x509_parser::certificate::X509Certificate::from_der(cert_der.as_ref()) {
+        Ok((_, cert)) => cert.subject() == cert.issuer(),
+        Err(_) => true, // conservative fallback
+    }
+}
+
 /// Python-facing config builder. Accumulates settings, then builds
 /// an immutable rustls ClientConfig/ServerConfig when a connection is created.
 #[pyclass]
 pub struct RustlsConfigBuilder {
     root_store: RootCertStore,
-    /// All user-loaded certs are ALSO stored here as intermediates.
-    /// During verification, these are concatenated with server-sent intermediates
-    /// so webpki can use them for chain building — matching OpenSSL's behavior
-    /// where load_verify_locations() certs are used as both trust anchors AND
-    /// intermediate cert sources.
+    /// ALL certs loaded via load_verify_locations() are stored here for
+    /// chain building. Only self-signed certs (root CAs) are ALSO added
+    /// to `root_store` as trust anchors. This ensures intermediates help
+    /// with chain building but cannot act as trust anchors on their own.
     extra_intermediates: Vec<CertificateDer<'static>>,
     client_cert_chain: Option<Vec<CertificateDer<'static>>>,
     client_key: Option<PrivateKeyDer<'static>>,
@@ -147,9 +159,18 @@ impl RustlsConfigBuilder {
         }
     }
 
-    /// Add root CA certs from PEM data. Returns number of certs added.
-    /// Certs are stored as both trust anchors (in root_store) AND as extra
-    /// intermediates for chain building — matching OpenSSL's behavior.
+    /// Add CA certs from PEM data. Returns number of certs added.
+    ///
+    /// Self-signed certs (subject == issuer) are added to `root_store` as
+    /// trust anchors.  Non-self-signed certs (intermediates) are added ONLY
+    /// to `extra_intermediates` for chain building — they must NOT become
+    /// trust anchors, or webpki would accept a chain that terminates at
+    /// an intermediate without reaching an actual root CA.
+    ///
+    /// ALL certs are also stored in `extra_intermediates` so they are
+    /// available for chain building (matching OpenSSL's behavior where
+    /// `load_verify_locations()` certs assist chain construction).
+    ///
     /// GIL is released during PEM parsing and certificate validation.
     fn add_root_certs_from_pem(&mut self, py: Python<'_>, pem_data: &[u8]) -> PyResult<usize> {
         let root_store = &mut self.root_store;
@@ -160,29 +181,42 @@ impl RustlsConfigBuilder {
             let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
                 .filter_map(|r| r.ok())
                 .collect();
+            let mut root_certs = Vec::new();
             for cert in &certs {
                 root_certs_der.push(cert.to_vec());
                 extra_intermediates.push(cert.clone());
+                // Only add self-signed certs (subject == issuer) to root_store.
+                // it's weak triaging for now. we'll implement the same algorithm
+                // as qh3 self signed check soon.
+                if is_self_signed(cert) {
+                    root_certs.push(cert.clone());
+                }
             }
-            let (added, _) = root_store.add_parsable_certificates(certs);
+            let (added, _) = root_store.add_parsable_certificates(root_certs);
             added
         });
         self.root_cert_count += result;
         Ok(result)
     }
 
-    /// Add a single root CA cert from DER data.
-    /// Also stored as an extra intermediate for chain building.
+    /// Add a single CA cert from DER data.
+    ///
+    /// Self-signed certs are added to `root_store` as trust anchors.
+    /// Non-self-signed certs (intermediates) are ONLY stored in
+    /// `extra_intermediates` for chain building.
     fn add_root_cert_from_der(&mut self, py: Python<'_>, der_data: &[u8]) -> PyResult<()> {
         let root_store = &mut self.root_store;
         let der_copy = der_data.to_vec();
         let extra_intermediates = &mut self.extra_intermediates;
-        let result = py.detach(|| {
+        let result: Result<(), String> = py.detach(|| {
             let cert = CertificateDer::from(der_copy.clone());
             extra_intermediates.push(cert.clone());
-            root_store
-                .add(cert)
-                .map_err(|e| format!("Invalid cert: {}", e))
+            if is_self_signed(&cert) {
+                root_store
+                    .add(cert)
+                    .map_err(|e| format!("Invalid cert: {}", e))?;
+            }
+            Ok(())
         });
         result.map_err(pyo3::exceptions::PyValueError::new_err)?;
         self.root_certs_der.push(der_data.to_vec());
@@ -220,7 +254,7 @@ impl RustlsConfigBuilder {
                 self.client_key = Some(key);
                 Ok(())
             }
-            Err(msg) => Err(pyo3::exceptions::PyValueError::new_err(msg)),
+            Err(msg) => Err(raise_ssl_error(py, &format!("[SSL] PEM lib ({})", msg))),
         }
     }
 
@@ -254,7 +288,7 @@ impl RustlsConfigBuilder {
                 self.server_key = Some(key);
                 Ok(())
             }
-            Err(msg) => Err(pyo3::exceptions::PyValueError::new_err(msg)),
+            Err(msg) => Err(raise_ssl_error(py, &format!("[SSL] PEM lib ({})", msg))),
         }
     }
 
