@@ -479,12 +479,19 @@ class TLSContext(_stdlib_ssl.SSLContext):
 
     @staticmethod
     def _load_pem_data(source: str | bytes | None) -> bytes:
-        """Load PEM data from a file path (str) or return raw bytes directly."""
+        """Load PEM data from a file path (str) or return raw bytes directly.
+
+        If a ``str`` looks like inline PEM content (contains ``-----BEGIN``),
+        it is encoded to bytes and returned directly instead of being treated
+        as a file path.  ``bytes`` are always returned as-is (raw PEM data).
+        """
         if source is None:
             raise SSLError("No certificate data provided")
         if isinstance(source, bytes):
             return source
         if isinstance(source, str):
+            if "-----BEGIN" in source:
+                return source.encode("ascii")
             with open(source, "rb") as f:
                 return f.read()
         raise TypeError(f"Expected str or bytes, got {type(source).__name__}")
