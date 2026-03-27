@@ -16,6 +16,7 @@ from ._constants import (
     PROTOCOL_TLS_SERVER,
     OP_NO_SSLv2,
     OP_NO_SSLv3,
+    Options,
     TLSVersion,
     VerifyMode,
 )
@@ -285,9 +286,9 @@ class TLSContext(_stdlib_ssl.SSLContext):
         self._check_hostname = value
         self._builder.set_check_hostname(value)
 
-    @property
-    def options(self) -> _stdlib_ssl.Options:
-        return _stdlib_ssl.Options(self._options)
+    @property  # type: ignore[override]
+    def options(self) -> Options:
+        return Options(self._options)
 
     @options.setter
     def options(self, value: int) -> None:
