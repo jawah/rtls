@@ -418,7 +418,25 @@ impl RustlsConfigBuilder {
                 }
             }
             if !selected.is_empty() {
-                return selected;
+                // Match stdlib behavior: set_ciphers() only controls TLS 1.2
+                // suites.  TLS 1.3 suites are always included (unless TLS 1.3
+                // is explicitly disabled via max_version / OP_NO_TLSv1_3).
+                let tls13_defaults: &[SupportedCipherSuite] = &[
+                    provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                    provider::cipher_suite::TLS13_AES_256_GCM_SHA384,
+                    provider::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                ];
+                let mut with_tls13 = Vec::new();
+                for &s in tls13_defaults {
+                    if !selected
+                        .iter()
+                        .any(|existing| existing.suite() == s.suite())
+                    {
+                        with_tls13.push(s);
+                    }
+                }
+                with_tls13.extend(selected);
+                return with_tls13;
             }
         }
         // Default: Chrome-like cipher suite order (AES-128 before AES-256)
