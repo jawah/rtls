@@ -45,6 +45,7 @@ dependencies = [
 include = [
   { path = "NOTICE", format = "sdist" },
   { path = "tests/**/*", format = "sdist" },
+  { path = "src/src/py.typed", format = "wheel" },
 ]
 exclude = [
   { path = "**/__pycache__/**", format = "sdist" },
