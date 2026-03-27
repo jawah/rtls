@@ -497,6 +497,52 @@ class TestContextProperties(unittest.TestCase):
         ctx.maximum_version = ssl.TLSVersion.TLSv1_2
         self.assertEqual(ctx.maximum_version, ssl.TLSVersion.TLSv1_2)
 
+    def test_options_does_not_reset_max_version(self):
+        """Setting options after maximum_version must not re-enable TLS 1.3.
+
+        This is the exact sequence urllib3-future's ``create_urllib3_context``
+        performs: set min/max version, *then* ``ctx.options |= ...``.
+        """
+        ctx = _make_ctx()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        # Now set options (no OP_NO_TLSv1_3 — just the harmless SSLv2/SSLv3)
+        ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
+        # The Python getter must still report TLSv1_2
+        self.assertEqual(ctx.maximum_version, ssl.TLSVersion.TLSv1_2)
+
+    def test_options_does_not_reset_max_version_connects_tls12(self):
+        """Functional proof: the urllib3-future pattern negotiates TLS 1.2."""
+        ctx = _make_ctx()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
+        ssock = _connect_tls(ctx=ctx)
+        try:
+            self.assertEqual(ssock.version(), "TLSv1.2")
+        finally:
+            ssock.close()
+
+    def test_options_does_not_reset_min_version(self):
+        """Setting options after minimum_version must not lower min back."""
+        ctx = _make_ctx()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+        ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
+        self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_3)
+
+    def test_op_no_tls13_after_explicit_max(self):
+        """OP_NO_TLSv1_3 can still further constrain after explicit max."""
+        ctx = _make_ctx()
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+        ctx.options |= ssl.OP_NO_TLSv1_3
+        # TLS 1.3 disabled — should connect with TLS 1.2
+        ssock = _connect_tls(ctx=ctx)
+        try:
+            self.assertEqual(ssock.version(), "TLSv1.2")
+        finally:
+            ssock.close()
+
     def test_post_handshake_auth(self):
         ctx = _make_ctx()
         ctx.post_handshake_auth = True
@@ -834,6 +880,13 @@ class TestConstants(unittest.TestCase):
         self.assertIsNotNone(ssl.PROTOCOL_TLS)
         self.assertIsNotNone(ssl.PROTOCOL_TLS_CLIENT)
         self.assertIsNotNone(ssl.PROTOCOL_TLS_SERVER)
+
+    def test_protocol_tlsv1_not_defined(self):
+        """PROTOCOL_TLSv1 and PROTOCOL_TLSv1_1 must NOT exist."""
+        self.assertEqual(getattr(ssl, "PROTOCOL_TLSv1", 0), 0)
+        self.assertEqual(getattr(ssl, "PROTOCOL_TLSv1_1", 0), 0)
+        self.assertFalse(hasattr(ssl, "PROTOCOL_TLSv1"))
+        self.assertFalse(hasattr(ssl, "PROTOCOL_TLSv1_1"))
 
     def test_cert_constants(self):
         self.assertEqual(ssl.CERT_NONE, 0)
