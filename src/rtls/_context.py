@@ -460,6 +460,12 @@ class TLSContext(_stdlib_ssl.SSLContext):
         # 4. Inject ECH into the *clone* only.
         clone._builder.set_ech_configs(bytes(ech_config_list))
 
+        # 5. ECH is inherently TLS 1.3 only — forcibly disable TLS 1.2.
+        from ._constants import TLSVersion
+
+        clone._minimum_version = TLSVersion.TLSv1_3
+        clone._builder.set_min_version(int(TLSVersion.TLSv1_3))
+
         return clone
 
     @property

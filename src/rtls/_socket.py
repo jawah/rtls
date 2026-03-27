@@ -154,6 +154,10 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
         self._flush_outgoing()
 
         timeout = self.gettimeout()
+        self._do_handshake_loop(timeout)
+
+    def _do_handshake_loop(self, timeout: float | None) -> None:
+        """Inner handshake loop - drives TLSObject.do_handshake()."""
         while True:
             try:
                 self._sslobj_internal.do_handshake()

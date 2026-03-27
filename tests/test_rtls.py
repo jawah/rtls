@@ -964,11 +964,11 @@ class TestECH(unittest.TestCase):
         self.assertEqual(ech_ctx.post_handshake_auth, ctx.post_handshake_auth)
         self.assertEqual(ech_ctx.protocol, ctx.protocol)
 
-    def test_ech_status_grease_by_default(self):
-        """Without explicit ECH config, ech_status is 'grease' (anti-ossification)."""
+    def test_ech_status_not_offered_by_default(self):
+        """Default context includes TLS 1.2, so ECH GREASE is not active."""
         ssock = _connect_tls()
         try:
-            self.assertEqual(ssock.ech_status, "grease")
+            self.assertEqual(ssock.ech_status, "not_offered")
         finally:
             ssock.close()
 
@@ -1053,6 +1053,9 @@ class TestRustlsFingerprint(unittest.TestCase):
     def test_ech_grease_is_sent(self):
         """tls.peet.ws must see an ECH GREASE extension in our ClientHello."""
         ctx = ssl.create_default_context()
+        ctx.minimum_version = (
+            ssl.TLSVersion.TLSv1_3
+        )  # disable TLS 1.2 -> activates GREASE
         with self.urllib3.PoolManager(ssl_context=ctx) as pm:
             resp = pm.urlopen(
                 "GET", "https://tls.peet.ws/api/all", timeout=CONNECT_TIMEOUT
@@ -1118,6 +1121,9 @@ class TestAsyncRustlsFingerprint(unittest.TestCase):
 
         async def _run():
             ctx = ssl.create_default_context()
+            ctx.minimum_version = (
+                ssl.TLSVersion.TLSv1_3
+            )  # disable TLS 1.2 -> activates GREASE
             async with self.urllib3.AsyncPoolManager(ssl_context=ctx) as pm:
                 resp = await pm.urlopen(
                     "GET", "https://tls.peet.ws/api/all", timeout=CONNECT_TIMEOUT

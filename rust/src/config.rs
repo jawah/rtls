@@ -480,12 +480,13 @@ impl RustlsConfigBuilder {
     /// Resolve ECH mode for the client connection.
     ///
     /// - If explicit ECH config bytes are set → `EchMode::Enable`
-    /// - If TLS 1.3 is enabled (default) → `EchMode::Grease` (anti-ossification, RFC 8701)
-    /// - If TLS 1.3 is disabled (e.g. max_version=TLS1.2) → `None` (use protocol_versions path)
+    /// - If TLS 1.2 is disabled (i.e. only TLS 1.3) AND no explicit ECH config
+    ///   --> `EchMode::Grease` (anti-ossification, RFC 8701)
+    /// - Otherwise (TLS 1.2 is in the version range) → `None` (use protocol_versions path)
     ///
-    /// ECH GREASE ensures that every TLS 1.3 ClientHello includes an
-    /// `encrypted_client_hello` extension, preventing middleboxes from
-    /// ossifying on its absence.
+    /// ECH (both GREASE and Enable) is inherently TLS 1.3 only.  Rather than
+    /// silently breaking TLS 1.2 servers, we only activate GREASE when TLS 1.2
+    /// has been explicitly disabled by the caller.
     fn resolve_ech_mode(&self) -> Result<Option<EchMode>, String> {
         let hpke_suites = provider::hpke::ALL_SUPPORTED_SUITES;
 
@@ -496,10 +497,12 @@ impl RustlsConfigBuilder {
                 .map_err(|e| format!("Failed to parse ECH config: {}", e))?;
             Ok(Some(EchMode::Enable(ech_config)))
         } else {
-            // GREASE only when TLS 1.3 is in the version range.
+            // GREASE only when TLS 1.2 is NOT in the version range
+            // (i.e. the caller explicitly restricted to TLS 1.3 only).
             let versions = self.get_protocol_versions();
+            let has_tls12 = versions.contains(&&rustls::version::TLS12);
             let has_tls13 = versions.contains(&&rustls::version::TLS13);
-            if !has_tls13 {
+            if has_tls12 || !has_tls13 {
                 return Ok(None);
             }
             let suite = hpke_suites
