@@ -10,7 +10,6 @@ Release History
 - Fixed ssl ctx options handling.
 - Fixed untriaged CA bundle anchors and intermediates.
 - Removed hostname_checks_common_name as Rustls don't support it.
-- Removed unsupported PROTOCOL constants.
 
 2026.3.26
 ---------
