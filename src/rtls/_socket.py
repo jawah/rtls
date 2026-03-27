@@ -104,7 +104,11 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
         if self._connected:
             self._create_sslobj()
             if self._do_handshake_on_connect:
-                self.do_handshake()
+                try:
+                    self.do_handshake()
+                except BaseException:
+                    self.close()
+                    raise
 
     def _create_sslobj(self) -> None:
         """Create the internal TLSObject."""
@@ -337,17 +341,32 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
         socket.socket.shutdown(self, how)
 
     def close(self) -> None:
-        """Close the TLS connection and underlying socket."""
-        if not self._closed:
-            self._closed = True
-            if self._sslobj_internal is not None:
-                try:
-                    self._sslobj_internal.unwrap()
-                    self._flush_outgoing()
-                except Exception:  # Defensive: maybe not swallow this(...)
-                    pass  # todo: think about it another time.
-                self._sslobj_internal = None
-            socket.socket.close(self)
+        """Close the TLS connection and underlying socket.
+
+        When ``makefile()`` references are still open (``_io_refs > 0``),
+        this only marks the socket as closed — the TLS state and fd stay
+        alive so buffered I/O streams (and direct send/recv) keep working.
+        The actual cleanup is deferred to ``_real_close()`` which runs once
+        all makefile references have been drained.
+        """
+        self._closed = True
+        if self._io_refs <= 0:  # type: ignore[attr-defined]
+            self._real_close()
+
+    def _real_close(self) -> None:
+        """Tear down TLS state and close the underlying fd.
+
+        Called by the inherited ``socket.socket`` machinery once
+        ``_io_refs`` drops to zero (all makefile wrappers are closed).
+        """
+        if self._sslobj_internal is not None:
+            try:
+                self._sslobj_internal.unwrap()
+                self._flush_outgoing()
+            except Exception:
+                pass
+            self._sslobj_internal = None
+        socket.socket._real_close(self)  # type: ignore[attr-defined]
 
     @property  # type: ignore[override]
     def context(self) -> TLSContext:
