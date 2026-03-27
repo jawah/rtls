@@ -1,6 +1,11 @@
 Release History
 ===============
 
+2026.3.28
+---------
+
+- Disabled eager ech grease when TLS 1.2 is still enabled.
+
 2026.3.27
 ---------
 
