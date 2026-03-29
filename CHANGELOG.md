@@ -1,6 +1,12 @@
 Release History
 ===============
 
+2026.3.29
+---------
+
+- Added `sslobj` public shortcut to `_sslobj` property for backward compatibility to TLSSocket.
+- Updated aws-lc-sys v0.39.0 to v0.39.1.
+
 2026.3.28
 ---------
 

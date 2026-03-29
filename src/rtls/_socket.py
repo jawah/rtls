@@ -397,10 +397,11 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
     @_sslobj.setter
     def _sslobj(self, value: Any) -> None:
         """Allow setting _sslobj (ssl.SSLSocket._real_close sets it to None)."""
-        if value is None:
-            self._sslobj_internal = None
-        else:
-            self._sslobj_internal = value
+        self._sslobj_internal = value
+
+    @property
+    def sslobj(self) -> TLSObject | None:
+        return self._sslobj_internal
 
     def get_verified_chain(self) -> list[TLSCertificate] | None:
         if self._sslobj_internal is None:
