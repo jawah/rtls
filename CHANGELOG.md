@@ -1,6 +1,15 @@
 Release History
 ===============
 
+2026.4.24
+---------
+
+- Updated aws-lc-rs v1.16.2 to v1.16.3
+- Updated rustls v0.23.37 to v0.23.39
+- Updated pyo3 v0.28.2 to v0.28.3
+- Fixed performance issue with DER_cert_to_PEM_cert and PEM_cert_to_DER_cert functions
+- Fixed honoring `VERIFY_X509_TRUSTED_FIRST` and `VERIFY_X509_PARTIAL_CHAIN`.
+
 2026.3.29
 ---------
 
