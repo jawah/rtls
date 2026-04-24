@@ -78,7 +78,7 @@ class Options(enum.IntFlag):
     def __contains__(self, other: object) -> bool:
         if isinstance(other, int):
             return (int(self) & int(other)) == int(other)
-        return NotImplemented
+        return NotImplemented  # Defensive: mimic stdlib
 
 
 OP_ALL = Options.OP_ALL

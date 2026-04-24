@@ -86,9 +86,13 @@ def PEM_cert_to_DER_cert(pem_cert_string: str) -> bytes:
     """Convert a PEM-encoded certificate to DER format."""
     # Strip header/footer and whitespace
     if not pem_cert_string.startswith(PEM_HEADER):
-        raise ValueError(f"Invalid PEM encoding; must start with {PEM_HEADER}")
+        raise ValueError(  # Defensive: stdlib cpy
+            f"Invalid PEM encoding; must start with {PEM_HEADER}"
+        )
     if not pem_cert_string.strip().endswith(PEM_FOOTER):
-        raise ValueError(f"Invalid PEM encoding; must end with {PEM_FOOTER}")
+        raise ValueError(  # Defensive: stdlib cpy
+            f"Invalid PEM encoding; must end with {PEM_FOOTER}"
+        )
     d = pem_cert_string.strip()[len(PEM_HEADER) : -len(PEM_FOOTER)]
     return base64.decodebytes(d.encode("ASCII", "strict"))
 
