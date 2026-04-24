@@ -2006,6 +2006,138 @@ class TestIntermediateCertChainBuilding(unittest.TestCase):
             t.join(timeout=5)
 
 
+class TestVerifyFlags(unittest.TestCase):
+    """Test that VERIFY_X509_STRICT vs VERIFY_X509_PARTIAL_CHAIN and
+    VERIFY_X509_TRUSTED_FIRST actually change certificate verification behavior.
+
+    Default (STRICT): only self-signed certs are trust anchors. Loading an
+    intermediate CA alone is NOT enough to verify a leaf signed by it.
+
+    PARTIAL_CHAIN / TRUSTED_FIRST: ALL loaded CA certs become trust anchors.
+    Loading an intermediate CA alone IS enough to verify a leaf signed by it
+    (the chain can terminate at the intermediate without reaching a root).
+    """
+
+    CERTDATA = os.path.join(os.path.dirname(__file__), "certdata")
+    ROOT_CERT = os.path.join(CERTDATA, "root_cert.pem")
+    INTERMEDIATE_CERT = os.path.join(CERTDATA, "intermediate_cert.pem")
+    LEAF_CERT = os.path.join(CERTDATA, "leaf_cert.pem")
+    LEAF_KEY = os.path.join(CERTDATA, "leaf_key.pem")
+
+    def _run_handshake(self, client_ctx):
+        """Start a TLS server sending only the leaf cert (no intermediate)
+        and attempt a client connection. Returns True on success, False on
+        SSLError/SSLCertVerificationError."""
+        import threading
+
+        server_ctx = TLSContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(certfile=self.LEAF_CERT, keyfile=self.LEAF_KEY)
+
+        result = {}
+
+        def server_thread(server_sock, ready_event):
+            ready_event.set()
+            try:
+                conn, _ = server_sock.accept()
+                ssl_conn = server_ctx.wrap_socket(conn, server_side=True)
+                ssl_conn.write(b"OK")
+                ssl_conn.close()
+                result["server"] = "ok"
+            except Exception as e:
+                result["server_error"] = str(e)
+
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(("127.0.0.1", 0))
+        server_sock.listen(1)
+        port = server_sock.getsockname()[1]
+
+        ready = threading.Event()
+        t = threading.Thread(target=server_thread, args=(server_sock, ready))
+        t.daemon = True
+        t.start()
+        ready.wait()
+
+        try:
+            with client_ctx.wrap_socket(
+                socket.socket(), server_hostname="localhost"
+            ) as s:
+                s.connect(("127.0.0.1", port))
+                data = s.read(1024)
+                assert data == b"OK"
+            return True
+        except (ssl.SSLError, SSLCertVerificationError):
+            return False
+        finally:
+            server_sock.close()
+            t.join(timeout=5)
+
+    def test_default_is_strict(self):
+        """verify_flags defaults to 0 (STRICT behavior)."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(ctx.verify_flags, 0)
+
+    def test_strict_intermediate_only_fails(self):
+        """STRICT (default): loading only the intermediate must FAIL.
+        The intermediate is not self-signed, so it is NOT a trust anchor."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Default verify_flags == 0 (STRICT)
+        ctx.load_verify_locations(cafile=self.INTERMEDIATE_CERT)
+
+        self.assertFalse(self._run_handshake(ctx))
+
+    def test_partial_chain_intermediate_only_succeeds(self):
+        """PARTIAL_CHAIN: loading only the intermediate must SUCCEED.
+        The intermediate is promoted to a trust anchor, so the chain
+        can terminate there without reaching a self-signed root."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.verify_flags = ssl.VERIFY_X509_PARTIAL_CHAIN
+        ctx.load_verify_locations(cafile=self.INTERMEDIATE_CERT)
+
+        self.assertTrue(self._run_handshake(ctx))
+
+    def test_trusted_first_intermediate_only_succeeds(self):
+        """TRUSTED_FIRST: loading only the intermediate must SUCCEED.
+        Same promotion to trust anchor as PARTIAL_CHAIN."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.verify_flags = ssl.VERIFY_X509_TRUSTED_FIRST
+        ctx.load_verify_locations(cafile=self.INTERMEDIATE_CERT)
+
+        self.assertTrue(self._run_handshake(ctx))
+
+    def test_strict_with_root_and_intermediate_succeeds(self):
+        """STRICT: loading both root AND intermediate must still succeed.
+        The root is self-signed (trust anchor) and the intermediate helps
+        chain building as expected."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Explicitly set STRICT
+        ctx.verify_flags = ssl.VERIFY_X509_STRICT
+        ctx.load_verify_locations(cafile=self.ROOT_CERT)
+        ctx.load_verify_locations(cafile=self.INTERMEDIATE_CERT)
+
+        self.assertTrue(self._run_handshake(ctx))
+
+    def test_flags_set_after_loading_certs(self):
+        """verify_flags set AFTER loading certs must still take effect.
+        The flag is evaluated at connection-build time, not cert-load time."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Load intermediate first (while flags are still 0 / STRICT)
+        ctx.load_verify_locations(cafile=self.INTERMEDIATE_CERT)
+        # Then set PARTIAL_CHAIN — should retroactively promote the
+        # already-loaded intermediate to a trust anchor.
+        ctx.verify_flags = ssl.VERIFY_X509_PARTIAL_CHAIN
+
+        self.assertTrue(self._run_handshake(ctx))
+
+    def test_combined_flags(self):
+        """Both TRUSTED_FIRST and PARTIAL_CHAIN set together must work."""
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.verify_flags = ssl.VERIFY_X509_TRUSTED_FIRST | ssl.VERIFY_X509_PARTIAL_CHAIN
+        ctx.load_verify_locations(cafile=self.INTERMEDIATE_CERT)
+
+        self.assertTrue(self._run_handshake(ctx))
+
+
 ###############################################################################
 # COVERAGE IMPROVEMENT TESTS
 # Target: raise from 87% to 98%+
@@ -2373,9 +2505,18 @@ class TestCovContext(unittest.TestCase):
             TLSContext._validate_cert_pem(pem)
 
     def test_verify_flags_setter(self):
-        """verify_flags setter is a no-op."""
+        """verify_flags setter stores the value and defaults to 0 (STRICT)."""
         ctx = _make_ctx()
-        ctx.verify_flags = 0x20  # No-op but shouldn't raise
+        self.assertEqual(ctx.verify_flags, 0)
+        ctx.verify_flags = ssl.VERIFY_X509_STRICT
+        self.assertEqual(ctx.verify_flags, ssl.VERIFY_X509_STRICT)
+        ctx.verify_flags = ssl.VERIFY_X509_PARTIAL_CHAIN
+        self.assertEqual(ctx.verify_flags, ssl.VERIFY_X509_PARTIAL_CHAIN)
+        ctx.verify_flags = ssl.VERIFY_X509_TRUSTED_FIRST | ssl.VERIFY_X509_PARTIAL_CHAIN
+        self.assertEqual(
+            ctx.verify_flags,
+            ssl.VERIFY_X509_TRUSTED_FIRST | ssl.VERIFY_X509_PARTIAL_CHAIN,
+        )
 
 
 class TestCovObject(unittest.TestCase):

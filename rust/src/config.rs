@@ -88,6 +88,10 @@ const CERT_REQUIRED: i32 = 2;
 const TLS_V1_2: u16 = 0x0303;
 const TLS_V1_3: u16 = 0x0304;
 
+/// Verify flags constants (must match Python ssl module)
+const VERIFY_X509_TRUSTED_FIRST: i32 = 0x8000;
+const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
+
 /// Check if a DER-encoded certificate is self-signed (subject == issuer).
 /// Self-signed certs are root CAs; non-self-signed certs are intermediates.
 /// If parsing fails, conservatively treats the cert as self-signed so it
@@ -119,6 +123,7 @@ pub struct RustlsConfigBuilder {
     cipher_suites: Option<Vec<String>>,
     verify_mode: i32,
     check_hostname: bool,
+    verify_flags: i32,
     sni_enabled: bool,
     keylog_filename: Option<String>,
 
@@ -149,6 +154,7 @@ impl RustlsConfigBuilder {
             cipher_suites: None,
             verify_mode: CERT_NONE,
             check_hostname: false,
+            verify_flags: 0,
             sni_enabled: true,
             keylog_filename: None,
             server_cert_chain: None,
@@ -318,6 +324,10 @@ impl RustlsConfigBuilder {
         self.check_hostname = check;
     }
 
+    fn set_verify_flags(&mut self, flags: i32) {
+        self.verify_flags = flags;
+    }
+
     fn set_sni_enabled(&mut self, enabled: bool) {
         self.sni_enabled = enabled;
     }
@@ -366,6 +376,7 @@ impl RustlsConfigBuilder {
             cipher_suites: cipher_suites.clone(),
             verify_mode: self.verify_mode,
             check_hostname: self.check_hostname,
+            verify_flags: self.verify_flags,
             sni_enabled: self.sni_enabled,
             keylog_filename: keylog_filename.clone(),
             server_cert_chain: server_cert_chain.clone(),
@@ -531,7 +542,29 @@ impl RustlsConfigBuilder {
             })
         };
 
-        let has_extra_intermediates = !self.extra_intermediates.is_empty();
+        // When VERIFY_X509_TRUSTED_FIRST or VERIFY_X509_PARTIAL_CHAIN is set,
+        // skip root-vs-intermediate sorting: ALL loaded CA certs become trust
+        // anchors. This matches OpenSSL's behavior for these flags, where
+        // intermediates can terminate a chain without reaching a self-signed root.
+        let skip_ca_sorting = (self.verify_flags & VERIFY_X509_TRUSTED_FIRST) != 0
+            || (self.verify_flags & VERIFY_X509_PARTIAL_CHAIN) != 0;
+
+        let (effective_root_store, effective_intermediates) = if skip_ca_sorting {
+            // Rebuild root store from ALL loaded certs (root_certs_der).
+            let mut store = RootCertStore::empty();
+            let all_certs: Vec<CertificateDer<'static>> = self
+                .root_certs_der
+                .iter()
+                .map(|der| CertificateDer::from(der.clone()))
+                .collect();
+            store.add_parsable_certificates(all_certs);
+            // No extra intermediates needed — everything is a trust anchor.
+            (store, Vec::new())
+        } else {
+            (self.root_store.clone(), self.extra_intermediates.clone())
+        };
+
+        let has_extra_intermediates = !effective_intermediates.is_empty();
 
         // Resolve ECH mode: Enable (explicit), Grease (TLS 1.3 default), or None (TLS 1.2 only).
         let ech_mode = self.resolve_ech_mode()?;
@@ -559,13 +592,13 @@ impl RustlsConfigBuilder {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
         } else if !self.check_hostname {
-            let root_store = Arc::new(self.root_store.clone());
+            let root_store = Arc::new(effective_root_store);
             let crypto_provider = make_provider();
 
             if has_extra_intermediates {
                 let verifier = NoHostnameVerifierWithIntermediates::new(
                     root_store,
-                    self.extra_intermediates.clone(),
+                    effective_intermediates,
                     &crypto_provider,
                 );
                 apply_versions_or_ech!(crypto_provider)?
@@ -583,13 +616,13 @@ impl RustlsConfigBuilder {
                     )))
             }
         } else {
-            let root_store = Arc::new(self.root_store.clone());
+            let root_store = Arc::new(effective_root_store);
             let crypto_provider = make_provider();
 
             if has_extra_intermediates {
                 let verifier = ServerVerifierWithIntermediates::new(
                     root_store,
-                    self.extra_intermediates.clone(),
+                    effective_intermediates,
                     &crypto_provider,
                 );
                 apply_versions_or_ech!(crypto_provider)?

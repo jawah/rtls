@@ -65,6 +65,7 @@ class TLSContext(_stdlib_ssl.SSLContext):
         self._sni_callback: Callable | None = None
         self._post_handshake_auth = False
         self._keylog_filename: str | None = None
+        self._verify_flags: int = 0
 
         # Cert/key data (kept for stats & reloads)
         self._cert_chain_loaded = False
@@ -362,11 +363,12 @@ class TLSContext(_stdlib_ssl.SSLContext):
 
     @property  # type: ignore[override]
     def verify_flags(self) -> int:
-        return 0  # Default verify flags
+        return self._verify_flags
 
     @verify_flags.setter
     def verify_flags(self, value: int) -> None:
-        pass  # rustls doesn't support granular verify flag control
+        self._verify_flags = int(value)
+        self._builder.set_verify_flags(self._verify_flags)
 
     @property
     def security_level(self) -> int:  # type: ignore[override]
@@ -455,6 +457,7 @@ class TLSContext(_stdlib_ssl.SSLContext):
         clone._cert_chain_loaded = self._cert_chain_loaded
         clone._ca_certs_loaded = self._ca_certs_loaded
         clone._num_ca_certs = self._num_ca_certs
+        clone._verify_flags = self._verify_flags
         clone._protocol = self._protocol
 
         # 4. Inject ECH into the *clone* only.
