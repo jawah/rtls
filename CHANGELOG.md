@@ -1,6 +1,12 @@
 Release History
 ===============
 
+2026.5.7
+--------
+
+- Fixed RuntimeError "Already borrowed" (https://github.com/jawah/niquests/issues/393)
+- Updated rustls v0.23.39 to v0.23.40
+
 2026.4.24
 ---------
 
