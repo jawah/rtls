@@ -4016,5 +4016,130 @@ class TestStdlibInterop(unittest.TestCase):
             t.join(timeout=5)
 
 
+class TestAlreadyBorrowedReproducer(unittest.TestCase):
+    """Reproducer for PyO3 'Already borrowed' RuntimeError.
+
+    The bug: when a Rust #[pymethods] &mut self method calls py.detach()
+    (releases GIL), the PyCell mutable borrow is still held. If another
+    thread acquires the GIL and calls another &mut self method on the
+    same object, PyO3's PyCell borrow checker panics with
+    "RuntimeError: Already borrowed".
+
+    This is the exact pattern from PyO3 issue #2525. The fix is
+    #[pyclass(frozen)] + Mutex with the lock acquired inside py.detach().
+
+    The test creates a loopback TLS connection, then races a reader
+    thread (which spends time in py.detach() via decrypt_incoming) against
+    a closer thread (which calls send_close_notify via unwrap/shutdown).
+    """
+
+    CERTDATA = os.path.join(os.path.dirname(__file__), "certdata")
+    ROOT_CERT = os.path.join(CERTDATA, "root_cert.pem")
+    LEAF_CHAIN = os.path.join(CERTDATA, "leaf_chain.pem")
+    LEAF_KEY = os.path.join(CERTDATA, "leaf_key.pem")
+
+    def test_concurrent_read_and_shutdown_no_already_borrowed(self):
+        """Race recv() against shutdown(), must not raise 'Already borrowed'.
+
+        Before the fix, this reliably triggers RuntimeError on most runs.
+        After the fix, both threads should complete without RuntimeError.
+        """
+        import threading
+        import ssl as _stdlib_ssl
+
+        server_ctx = _stdlib_ssl.SSLContext(_stdlib_ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(certfile=self.LEAF_CHAIN, keyfile=self.LEAF_KEY)
+
+        server_ready = threading.Event()
+        server_result = {}
+
+        def echo_server(srv_sock):
+            server_ready.set()
+            try:
+                conn, _ = srv_sock.accept()
+                ssl_conn = server_ctx.wrap_socket(conn, server_side=True)
+                # Send a large stream so the client spends time in decrypt_incoming
+                try:
+                    for _ in range(500):
+                        ssl_conn.sendall(b"X" * 4096)
+                except Exception:
+                    pass
+                try:
+                    ssl_conn.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                ssl_conn.close()
+                server_result["ok"] = True
+            except Exception as e:
+                server_result["error"] = repr(e)
+
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(1)
+        srv_sock.settimeout(10)
+        port = srv_sock.getsockname()[1]
+
+        srv_thread = threading.Thread(target=echo_server, args=(srv_sock,))
+        srv_thread.daemon = True
+        srv_thread.start()
+        server_ready.wait()
+
+        client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_ctx.load_verify_locations(cafile=self.ROOT_CERT)
+
+        raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+        ssock = client_ctx.wrap_socket(raw, server_hostname="localhost")
+
+        errors = []
+        already_borrowed_seen = threading.Event()
+
+        def reader():
+            """Read in a tight loop, spends time in py.detach() via decrypt_incoming."""
+            try:
+                while True:
+                    data = ssock.recv(1)  # Tiny reads = more py.detach() calls
+                    if not data:
+                        break
+            except RuntimeError as e:
+                if "Already borrowed" in str(e):
+                    errors.append(e)
+                    already_borrowed_seen.set()
+            except Exception:
+                pass  # EOF / connection reset / etc. are expected
+
+        def closer():
+            """Call shutdown after a tiny delay, triggers send_close_notify."""
+            import time
+            time.sleep(0.005)  # Let reader start and enter py.detach()
+            try:
+                ssock.shutdown(socket.SHUT_RDWR)
+            except RuntimeError as e:
+                if "Already borrowed" in str(e):
+                    errors.append(e)
+                    already_borrowed_seen.set()
+            except Exception:
+                pass  # Connection errors are expected
+
+        reader_t = threading.Thread(target=reader)
+        closer_t = threading.Thread(target=closer)
+        reader_t.start()
+        closer_t.start()
+        reader_t.join(timeout=10)
+        closer_t.join(timeout=10)
+
+        srv_sock.close()
+        srv_thread.join(timeout=5)
+
+        # After the fix: no "Already borrowed" errors should occur.
+        # Before the fix: this assertion would fail.
+        self.assertEqual(
+            len(errors),
+            0,
+            f"Got 'Already borrowed' RuntimeError(s): {errors}. "
+            f"This indicates the PyO3 PyCell borrow conflict is still present.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
