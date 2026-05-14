@@ -1,6 +1,14 @@
 Release History
 ===============
 
+2026.5.14
+---------
+
+- Fixed fallback `load_default_certs` ignoring `SSL_CERT_FILE` and `SSL_CERT_DIR` environment variables.
+  CPython default on OpenSSL, which in turn respect `SSL_CERT_FILE` and `SSL_CERT_DIR` via the load_default_certs.
+  rtls will now align itself on OpenSSL behavior. (https://github.com/jawah/urllib3.future/issues/368)
+- Updated aws-lc-rs v1.16.3 to v1.17.0
+
 2026.5.7
 --------
 
