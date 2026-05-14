@@ -2369,6 +2369,84 @@ class TestCovContext(unittest.TestCase):
         self.assertTrue(ctx._ca_certs_loaded)
         self.assertEqual(ctx._num_ca_certs, 2)
 
+    # CPython's ssl.SSLContext.set_default_verify_paths() honors these env
+    # vars (via OpenSSL's SSL_CTX_set_default_verify_paths) and
+    # load_default_certs() calls set_default_verify_paths() internally, so it
+    # must honor them too. Previously rtls aliased both methods to a
+    # wassima-only loader and ignored the environment.
+    # See: load_default_certs/set_default_verify_paths in src/rtls/_context.py
+    # discovered via https://github.com/jawah/urllib3.future/issues/368
+    # and https://github.com/jawah/niquests/issues/397
+
+    _CADATA_PEM = os.path.join(
+        os.path.dirname(__file__), "certdata", "pycacert.pem"
+    )
+    _CADATA_DIR = os.path.join(os.path.dirname(__file__), "certdata", "capath")
+
+    def _clear_cert_env(self):
+        for k in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+            os.environ.pop(k, None)
+
+    def test_set_default_verify_paths_honors_SSL_CERT_FILE(self):
+        self.addCleanup(self._clear_cert_env)
+        self._clear_cert_env()
+        os.environ["SSL_CERT_FILE"] = self._CADATA_PEM
+
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(ctx._num_ca_certs, 0)
+        ctx.set_default_verify_paths()
+        self.assertGreaterEqual(ctx._num_ca_certs, 1)
+
+    def test_set_default_verify_paths_honors_SSL_CERT_DIR(self):
+        self.addCleanup(self._clear_cert_env)
+        self._clear_cert_env()
+        os.environ["SSL_CERT_DIR"] = self._CADATA_DIR
+
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(ctx._num_ca_certs, 0)
+        ctx.set_default_verify_paths()
+        self.assertGreaterEqual(ctx._num_ca_certs, 1)
+
+    def test_set_default_verify_paths_no_env_is_noop(self):
+        self.addCleanup(self._clear_cert_env)
+        self._clear_cert_env()
+
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.set_default_verify_paths()
+        # No env vars, no wassima call -> should remain at 0.
+        self.assertEqual(ctx._num_ca_certs, 0)
+
+    def test_set_default_verify_paths_ignores_missing_paths(self):
+        """Bogus env values must not crash (mirrors OpenSSL silent ignore)."""
+        self.addCleanup(self._clear_cert_env)
+        self._clear_cert_env()
+        os.environ["SSL_CERT_FILE"] = "/nonexistent/path/to/ca.pem"
+        os.environ["SSL_CERT_DIR"] = "/nonexistent/dir"
+
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.set_default_verify_paths()  # must not raise
+        self.assertEqual(ctx._num_ca_certs, 0)
+
+    def test_load_default_certs_honors_SSL_CERT_FILE(self):
+        """load_default_certs must invoke set_default_verify_paths so that
+        SSL_CERT_FILE / SSL_CERT_DIR are added on top of the OS trust store
+        matching CPython behavior."""
+        from unittest.mock import patch
+
+        self.addCleanup(self._clear_cert_env)
+        self._clear_cert_env()
+        os.environ["SSL_CERT_FILE"] = self._CADATA_PEM
+
+        ctx = TLSContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Stub out wassima so the test is hermetic and doesn't depend on the
+        # host trust store size.
+        with patch("wassima.root_der_certificates", return_value=[]):
+            ctx.load_default_certs()
+
+        # The PEM from SSL_CERT_FILE must have contributed at least 1 cert.
+        self.assertGreaterEqual(ctx._num_ca_certs, 1)
+        self.assertTrue(ctx._ca_certs_loaded)
+
     def test_min_version_minimum_supported(self):
         """Lines 328-329: minimum_version=MINIMUM_SUPPORTED."""
         ctx = _make_ctx()

@@ -215,11 +215,27 @@ class TLSContext(_stdlib_ssl.SSLContext):
         self._ca_certs_loaded = True
         self._num_ca_certs += loaded
 
-    def load_default_certs(self, purpose: Any = None) -> None:
-        """Load the default set of CA certificates via wassima.
+    def set_default_verify_paths(self) -> None:
+        """Honor ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` env vars.
 
-        Uses wassima.root_der_certificates() to extract the OS trust store
-        and feeds each DER cert into the Rust builder.
+        Mirrors CPython's ``SSLContext.set_default_verify_paths()``, which
+        delegates to OpenSSL's ``SSL_CTX_set_default_verify_paths`` and reads
+        these environment variables. We do not have OpenSSL build-time default
+        paths to fall back on; if neither variable is set, this is a no-op.
+        """
+        cafile = os.environ.get("SSL_CERT_FILE")
+        capath = os.environ.get("SSL_CERT_DIR")
+        if cafile and os.path.isfile(cafile):
+            self.load_verify_locations(cafile=cafile)
+        if capath and os.path.isdir(capath):
+            self.load_verify_locations(capath=capath)
+
+    def load_default_certs(self, purpose: Any = None) -> None:
+        """Load the default set of CA certificates.
+
+        Loads the OS trust store via wassima and additionally honors
+        the ``SSL_CERT_FILE`` and ``SSL_CERT_DIR`` environment variables, in
+        line with default CPython OpenSSL bridge.
         """
         import wassima
 
@@ -229,8 +245,9 @@ class TLSContext(_stdlib_ssl.SSLContext):
         self._num_ca_certs += len(der_certs)
         self._ca_certs_loaded = True
 
-    # Alias matching CPython ssl.SSLContext.load_default_certs
-    set_default_verify_paths = load_default_certs
+        # Mirror CPython: load_default_certs always invokes
+        # set_default_verify_paths so SSL_CERT_FILE/SSL_CERT_DIR are honored.
+        self.set_default_verify_paths()
 
     def set_ciphers(self, ciphers: str) -> None:
         """Set cipher suites using an OpenSSL cipher string.
