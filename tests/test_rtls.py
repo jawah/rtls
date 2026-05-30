@@ -33,6 +33,45 @@ HTTPBIN_PORT = 443
 CONNECT_TIMEOUT = 15
 
 
+def _perf_stream_server(port_q, total, certfile, keyfile):
+    """Module-level streaming TLS server for the async perf test.
+
+    Runs in a separate process (so it does not contend with the client
+    for the GIL, which would otherwise bias an in-process comparison).
+    Streams 64 KiB blocks...
+    """
+    import os as _os
+    import socket as _socket
+    import ssl as _ssl
+
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    ss = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    ss.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    ss.bind(("127.0.0.1", 0))
+    ss.listen(1)
+    ss.settimeout(60)
+    port_q.put(ss.getsockname()[1])
+    try:
+        conn, _ = ss.accept()
+    except Exception:
+        return
+    c = ctx.wrap_socket(conn, server_side=True)
+    payload = _os.urandom(65536)
+    sent = 0
+    try:
+        while sent < total:
+            c.sendall(payload)
+            sent += len(payload)
+    except Exception:
+        pass
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
 def _make_ctx(
     verify: bool = False,
     alpn: list[str] | None = None,
@@ -3371,83 +3410,84 @@ class TestCovSocketRecvEOF(unittest.TestCase):
         finally:
             ssock.close()
 
-    def test_recv_sslerror_from_read(self):
-        """Lines 219-222: SSLEOFError raised directly from sslobj.read."""
-        from unittest.mock import MagicMock
-
-        ssock = _connect_tls()
-        try:
-            # Replace sslobj_internal with a mock that raises SSLEOFError from read
-            mock_obj = MagicMock()
-            mock_obj.read.side_effect = SSLEOFError("EOF occurred")
-            ssock._sslobj_internal = mock_obj
-            ssock._suppress_ragged_eofs = True
-            result = ssock.recv(1024)
-            self.assertEqual(result, b"")
-        finally:
-            ssock.close()
-
-    def test_recv_sslerror_from_read_no_suppress(self):
-        """Lines 219-222: SSLEOFError without suppress_ragged_eofs raises."""
-        from unittest.mock import MagicMock
-
-        ssock = _connect_tls()
-        try:
-            mock_obj = MagicMock()
-            mock_obj.read.side_effect = SSLEOFError("EOF occurred")
-            ssock._sslobj_internal = mock_obj
-            ssock._suppress_ragged_eofs = False
-            with self.assertRaises(SSLEOFError):
-                ssock.recv(1024)
-        finally:
-            ssock.close()
-
-    def test_recv_sslzeroreturn_from_read(self):
-        """Lines 217-218: SSLZeroReturnError from sslobj.read returns b''."""
-        from unittest.mock import MagicMock
-
-        ssock = _connect_tls()
-        try:
-            mock_obj = MagicMock()
-            mock_obj.read.side_effect = SSLZeroReturnError("connection closed")
-            ssock._sslobj_internal = mock_obj
-            result = ssock.recv(1024)
-            self.assertEqual(result, b"")
-        finally:
-            ssock.close()
-
-    def test_recv_pull_incoming_eof_suppressed(self):
-        """Lines 213-216: SSLEOFError from _pull_incoming is suppressed."""
+    def test_recv_eof_from_socket_suppressed(self):
+        """EOF from the underlying socket is suppressed -> returns b''."""
         from unittest.mock import MagicMock, patch
 
         ssock = _connect_tls()
         try:
-            mock_obj = MagicMock()
-            mock_obj.read.side_effect = SSLWantReadError("need more data")
-            ssock._sslobj_internal = mock_obj
+            obj = MagicMock()
+            obj._shutdown = False
+            obj.has_pending.return_value = False
+            obj._incoming.pending = 0
+            ssock._sslobj_internal = obj
             ssock._suppress_ragged_eofs = True
-            # Make _pull_incoming raise SSLEOFError
-            with patch.object(ssock, "_pull_incoming", side_effect=SSLEOFError("EOF")):
-                with patch.object(ssock, "_flush_outgoing"):
-                    result = ssock.recv(1024)
-                    self.assertEqual(result, b"")
+            with patch("socket.socket.recv", return_value=b""):
+                self.assertEqual(ssock.recv(1024), b"")
         finally:
             ssock.close()
 
-    def test_recv_pull_incoming_eof_not_suppressed(self):
-        """Lines 213-216: SSLEOFError from _pull_incoming raises when not suppressed."""
+    def test_recv_eof_from_socket_not_suppressed(self):
+        """EOF from the underlying socket raises when not suppressed."""
         from unittest.mock import MagicMock, patch
 
         ssock = _connect_tls()
         try:
-            mock_obj = MagicMock()
-            mock_obj.read.side_effect = SSLWantReadError("need more data")
-            ssock._sslobj_internal = mock_obj
+            obj = MagicMock()
+            obj._shutdown = False
+            obj.has_pending.return_value = False
+            obj._incoming.pending = 0
+            ssock._sslobj_internal = obj
             ssock._suppress_ragged_eofs = False
-            with patch.object(ssock, "_pull_incoming", side_effect=SSLEOFError("EOF")):
-                with patch.object(ssock, "_flush_outgoing"):
-                    with self.assertRaises(SSLEOFError):
-                        ssock.recv(1024)
+            with patch("socket.socket.recv", return_value=b""):
+                with self.assertRaises(SSLEOFError):
+                    ssock.recv(1024)
+        finally:
+            ssock.close()
+
+    def test_recv_after_shutdown_returns_empty(self):
+        """recv after TLS shutdown (obj._shutdown) returns b''."""
+        from unittest.mock import MagicMock
+
+        ssock = _connect_tls()
+        try:
+            obj = MagicMock()
+            obj._shutdown = True
+            ssock._sslobj_internal = obj
+            self.assertEqual(ssock.recv(1024), b"")
+        finally:
+            ssock.close()
+
+    def test_recv_zero_return_from_feed_drain(self):
+        """SSLZeroReturnError while draining buffered data → returns b''."""
+        from unittest.mock import MagicMock
+
+        ssock = _connect_tls()
+        try:
+            obj = MagicMock()
+            obj._shutdown = False
+            obj.has_pending.return_value = True
+            obj._incoming.pending = 0
+            obj.feed_decrypt.side_effect = SSLZeroReturnError("closed")
+            ssock._sslobj_internal = obj
+            self.assertEqual(ssock.recv(1024), b"")
+        finally:
+            ssock.close()
+
+    def test_recv_zero_return_from_feed_chunk(self):
+        """SSLZeroReturnError after feeding a network chunk → returns b''."""
+        from unittest.mock import MagicMock, patch
+
+        ssock = _connect_tls()
+        try:
+            obj = MagicMock()
+            obj._shutdown = False
+            obj.has_pending.return_value = False
+            obj._incoming.pending = 0
+            obj.feed_decrypt.side_effect = SSLZeroReturnError("closed")
+            ssock._sslobj_internal = obj
+            with patch("socket.socket.recv", return_value=b"ciphertext"):
+                self.assertEqual(ssock.recv(1024), b"")
         finally:
             ssock.close()
 
@@ -3955,6 +3995,205 @@ class TestStdlibInterop(unittest.TestCase):
 
         self.assertEqual(result.get("server"), "ok")
         self.assertEqual(h.hexdigest(), result["digest"])
+
+    def _start_streaming_server(self, total):
+        """Spawn a stdlib ssl server thread that streams n bytes.
+
+        Returns (server_sock, thread, port). The server sends fixed
+        64 KiB blocks until n bytes have been written, then closes.
+        """
+        import threading
+
+        server_ctx = self._make_stdlib_server_ctx()
+
+        def streaming_server(server_sock):
+            conn = None
+            ssl_conn = None
+            try:
+                conn, _ = server_sock.accept()
+                ssl_conn = server_ctx.wrap_socket(conn, server_side=True)
+                payload = os.urandom(65536)
+                sent = 0
+                while sent < total:
+                    ssl_conn.sendall(payload)
+                    sent += len(payload)
+            except Exception:
+                pass
+            finally:
+                if ssl_conn is not None:
+                    try:
+                        ssl_conn.close()
+                    except Exception:
+                        pass
+                elif conn is not None:
+                    conn.close()
+
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(("127.0.0.1", 0))
+        server_sock.listen(1)
+        server_sock.settimeout(60)
+        port = server_sock.getsockname()[1]
+
+        t = threading.Thread(target=streaming_server, args=(server_sock,))
+        t.daemon = True
+        t.start()
+        return server_sock, t, port
+
+    def test_perf_sync_pulls_64kib_from_network(self):
+        """sync TLSSocket must pulls 64 KiB per recv."""
+        import time
+
+        TOTAL = 64 * 1024 * 1024  # 64 MiB
+        BLOCK = 65536
+
+        server_sock, t, port = self._start_streaming_server(TOTAL)
+
+        # Record the buffer size requested on every raw network recv.
+        orig_recv = socket.socket.recv
+        requested_sizes = []
+
+        def recording_recv(self, buflen=0, *a, **k):
+            requested_sizes.append(buflen)
+            return orig_recv(self, buflen, *a, **k)
+
+        socket.socket.recv = recording_recv
+        try:
+            client_ctx = self._make_rtls_client_ctx()
+            with client_ctx.wrap_socket(
+                socket.socket(), server_hostname="localhost"
+            ) as s:
+                s.connect(("127.0.0.1", port))
+                received = 0
+                start = time.perf_counter()
+                while received < TOTAL:
+                    chunk = s.recv(BLOCK)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                elapsed = time.perf_counter() - start
+        finally:
+            socket.socket.recv = orig_recv
+            server_sock.close()
+            t.join(timeout=60)
+
+        self.assertEqual(received, TOTAL)
+
+        # Steady-state network reads must request 64 KiB.
+        steady = [n for n in requested_sizes if n > 0]
+        self.assertTrue(steady, "no network recv calls were recorded")
+        self.assertEqual(
+            max(steady),
+            65536,
+            f"expected 64 KiB network pulls, saw max={max(steady)}",
+        )
+        # Average bytes-per-recv must exceed the old 16 KiB cap, proving
+        # we are no longer doing one-record-per-syscall reads.
+        avg = received / len(steady)
+        self.assertGreater(
+            avg,
+            16384,
+            f"avg bytes/recv={avg:.0f} — looks capped at the old 16 KiB pull",
+        )
+
+        mbps = received / elapsed / (1024 * 1024)
+        print(
+            f"\n[perf] sync rtls download: {received / (1024 * 1024):.0f} MiB "
+            f"in {elapsed:.2f}s = {mbps:.0f} MiB/s "
+            f"(recv calls={len(steady)}, avg={avg:.0f} B)"
+        )
+
+    def test_perf_async_throughput_competitive(self):
+        """asyncio rtls decrypt throughput stays in the same league as sync.
+
+        The async path uses the sans-I/O TLSObject (wrap_bio);
+        """
+        import multiprocessing as mp
+        import time
+
+        TOTAL = 256 * 1024 * 1024  # 256 MiB
+        BLOCK = 65536
+        mpctx = mp.get_context("spawn")
+
+        async def async_download(port, ctx):
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", port, ssl=ctx, server_hostname="localhost"
+            )
+            received = 0
+            start = time.perf_counter()
+            while received < TOTAL:
+                chunk = await reader.read(BLOCK)
+                if not chunk:
+                    break
+                received += len(chunk)
+            elapsed = time.perf_counter() - start
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return received, elapsed
+
+        def run_async(port, ctx):
+            return asyncio.run(async_download(port, ctx))
+
+        def sync_download(port, ctx):
+            with ctx.wrap_socket(
+                socket.socket(), server_hostname="localhost"
+            ) as s:
+                s.connect(("127.0.0.1", port))
+                received = 0
+                start = time.perf_counter()
+                while received < TOTAL:
+                    chunk = s.recv(BLOCK)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                return received, time.perf_counter() - start
+
+        def best_throughput(make_ctx, download):
+            best = 0.0
+            for _ in range(3):
+                port_q = mpctx.Queue()
+                proc = mpctx.Process(
+                    target=_perf_stream_server,
+                    args=(port_q, TOTAL, self.LEAF_CHAIN, self.LEAF_KEY),
+                    daemon=True,
+                )
+                proc.start()
+                try:
+                    port = port_q.get(timeout=30)
+                    received, elapsed = download(port, make_ctx())
+                finally:
+                    proc.join(timeout=60)
+                    if proc.is_alive():
+                        proc.terminate()
+                self.assertEqual(received, TOTAL)
+                best = max(best, received / elapsed / (1024 * 1024))
+            return best
+
+        def stdlib_ctx():
+            ctx = _stdlib_ssl.SSLContext(_stdlib_ssl.PROTOCOL_TLS_CLIENT)
+            ctx.load_verify_locations(cafile=self.ROOT_CERT)
+            return ctx
+
+        rtls_sync = best_throughput(self._make_rtls_client_ctx, sync_download)
+        rtls_async = best_throughput(self._make_rtls_client_ctx, run_async)
+        stdlib_async = best_throughput(stdlib_ctx, run_async)
+
+        print(
+            f"\n[perf] rtls sync={rtls_sync:.0f} MiB/s "
+            f"rtls async={rtls_async:.0f} MiB/s "
+            f"(stdlib async={stdlib_async:.0f} MiB/s, "
+            f"async/sync={rtls_async / rtls_sync:.2f})"
+        )
+
+        self.assertGreater(
+            rtls_async,
+            0.2 * rtls_sync,
+            f"async rtls throughput {rtls_async:.0f} MiB/s collapsed "
+            f"vs sync {rtls_sync:.0f} MiB/s - possible decrypt regression",
+        )
 
     def test_keylog_filename_writes_secrets(self):
         """keylog_filename writes TLS secrets without $SSLKEYLOGFILE env var."""

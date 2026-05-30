@@ -1,6 +1,11 @@
 Release History
 ===============
 
+2026.5.30
+---------
+
+- Fixed general performance issue. Expect 30% faster throughput in general.
+
 2026.5.14
 ---------
 

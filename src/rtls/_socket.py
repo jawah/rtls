@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 _DEFAULT_BUFFER_SIZE = 16384
 
+# Size of each ciphertext read from the underlying network socket.
+_SOCKET_READ_BUFFER_SIZE = 65536
+
 
 class TLSSocket(_stdlib_ssl.SSLSocket):
     """TLS-wrapped socket, equivalent of ``ssl.SSLSocket``.
@@ -194,28 +197,57 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
         """Receive decrypted data."""
         if buflen == 0:
             return b""
-        if self._sslobj_internal is None:
+        obj = self._sslobj_internal
+        if obj is None:
             raise SSLError("SSL handshake not done")
-
-        timeout = self.gettimeout()
+        if obj._shutdown:
+            return b""
 
         while True:
-            try:
-                return self._sslobj_internal.read(buflen)  # type: ignore[return-value]
-            except SSLWantReadError:
-                self._flush_outgoing()
+            # 1. Drain plaintext rustls already holds, without touching the
+            #    network (post-handshake leftover, or data buffered because
+            #    a previous decrypt filled the caller's buffer).
+            if obj.has_pending() or obj._incoming.pending:
                 try:
-                    self._pull_incoming(timeout)
-                except SSLEOFError:
-                    if self._suppress_ragged_eofs:
-                        return b""
-                    raise
-            except SSLZeroReturnError:
-                return b""
-            except SSLEOFError:
+                    data = obj.feed_decrypt(b"", buflen)
+                except SSLZeroReturnError:
+                    return b""
+                if data:
+                    return data
+
+            # 2. Flush any control messages queued by rustls.
+            self._flush_outgoing()
+
+            # 3. Read more ciphertext directly from the network.
+            try:
+                chunk = socket.socket.recv(self, _SOCKET_READ_BUFFER_SIZE)
+            except (BlockingIOError, InterruptedError):
+                raise SSLWantReadError(
+                    SSL_ERROR_WANT_READ, "The read operation did not complete"
+                )
+            except (socket.timeout, TimeoutError):
+                raise  # Let timeout propagate unchanged.
+            except OSError as e:
+                if e.errno == errno.EAGAIN or e.errno == errno.EWOULDBLOCK:
+                    raise SSLWantReadError(
+                        SSL_ERROR_WANT_READ, "The read operation did not complete"
+                    )
+                raise
+
+            if not chunk:
+                # EOF on the underlying transport.
                 if self._suppress_ragged_eofs:
                     return b""
-                raise
+                raise SSLEOFError("EOF occurred in violation of protocol")
+
+            # 4. Feed + decrypt. If only handshake/control records arrived
+            #    this yields no plaintext — loop and read more.
+            try:
+                data = obj.feed_decrypt(chunk, buflen)
+            except SSLZeroReturnError:
+                return b""
+            if data:
+                return data
 
     def recv_into(self, buffer: bytearray, nbytes: int = 0, flags: int = 0) -> int:  # type: ignore[override]
         """Receive decrypted data into a buffer."""
@@ -261,7 +293,7 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
     def _pull_incoming(self, timeout: float | None = None) -> None:
         """Read ciphertext from the network into the incoming BIO."""
         try:
-            data = socket.socket.recv(self, _DEFAULT_BUFFER_SIZE)
+            data = socket.socket.recv(self, _SOCKET_READ_BUFFER_SIZE)
         except (BlockingIOError, InterruptedError):
             raise SSLWantReadError(
                 SSL_ERROR_WANT_READ, "The read operation did not complete"

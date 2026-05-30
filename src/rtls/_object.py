@@ -66,6 +66,9 @@ class TLSObject:
         self._handshake_done = False
         self._shutdown = False
 
+        self._pending_ct: bytes = b""
+        self._maybe_buffered = False
+
         # Build the Rust connection via the context's config builder
         self._init_connection()
 
@@ -152,6 +155,8 @@ class TLSObject:
             )
 
         self._handshake_done = True
+        # process_new_packets() may have decrypted early application data
+        self._maybe_buffered = True
 
     def read(self, n: int = -1, buffer: bytearray | None = None) -> bytes | int:
         """Read decrypted data from the TLS connection.
@@ -166,7 +171,7 @@ class TLSObject:
         if self._shutdown:
             raise SSLZeroReturnError("TLS/SSL connection has been closed")
 
-        max_len = n if n > 0 else 16384
+        max_len = n if n > 0 else 65536
 
         # Read all available ciphertext from the BIO
         ciphertext = self._incoming.read()
@@ -206,6 +211,37 @@ class TLSObject:
         raise SSLWantReadError(
             SSL_ERROR_WANT_READ, "The read operation did not complete"
         )
+
+    def has_pending(self) -> bool:
+        """True if plaintext may be available without reading the network.``."""
+        return bool(self._pending_ct) or self._maybe_buffered
+
+    def feed_decrypt(self, ciphertext: bytes, max_len: int) -> bytes:
+        """Synchronous fast-path read used by :class:`TLSSocket`."""
+        if self._shutdown:
+            raise SSLZeroReturnError("TLS/SSL connection has been closed")
+
+        # Absorb any ciphertext left in the incoming BIO
+        if self._incoming.pending:
+            self._pending_ct = bytes(self._incoming.read()) + self._pending_ct
+
+        pending = self._pending_ct
+        if pending:
+            ciphertext = pending + ciphertext if ciphertext else pending
+            self._pending_ct = b""
+
+        if ciphertext:
+            plaintext, unconsumed = self._conn.decrypt_incoming(ciphertext, max_len)
+            self._pending_ct = unconsumed
+            # Flush any control messages rustls produced (key updates, etc).
+            self._flush_outgoing()
+            self._maybe_buffered = bool(unconsumed) or len(plaintext) >= max_len
+            return plaintext
+
+        # drain already decrypted.
+        plaintext = self._conn.read_plaintext(max_len)
+        self._maybe_buffered = len(plaintext) >= max_len
+        return plaintext
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
         """Write plaintext data to be encrypted and sent.
