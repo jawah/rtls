@@ -2,14 +2,16 @@ use std::fs;
 
 fn main() {
     // Extract dependency versions from Cargo.lock so we can expose them
-    // at compile time via env!("RUSTLS_VERSION") and env!("AWS_LC_RS_VERSION").
+    // at compile time for backend-neutral version reporting.
     let lock = fs::read_to_string("Cargo.lock").expect("Cannot read Cargo.lock");
 
     let rustls_version = extract_version(&lock, "rustls");
     let aws_lc_rs_version = extract_version(&lock, "aws-lc-rs");
+    let ring_version = extract_version(&lock, "ring");
 
     println!("cargo:rustc-env=RUSTLS_VERSION={}", rustls_version);
     println!("cargo:rustc-env=AWS_LC_RS_VERSION={}", aws_lc_rs_version);
+    println!("cargo:rustc-env=RING_VERSION={}", ring_version);
     println!("cargo:rerun-if-changed=Cargo.lock");
 }
 

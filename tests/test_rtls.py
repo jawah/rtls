@@ -22,7 +22,7 @@ from rtls._exceptions import (
     SSLZeroReturnError,
 )
 from rtls._object import TLSObject
-from rtls._socket import TLSSocket
+from rtls._socket import TLSStreamSocket, TLSSocket
 
 
 EXAMPLE_HOST = "example.com"
@@ -2600,6 +2600,10 @@ class TestCovContext(unittest.TestCase):
         result = TLSContext._load_pem_data(data)
         self.assertEqual(result, data)
 
+    def test_load_pem_data_inline_string(self):
+        data = "-----BEGIN CERTIFICATE-----\ndata\n-----END CERTIFICATE-----"
+        self.assertEqual(TLSContext._load_pem_data(data), data.encode("ascii"))
+
     def test_validate_cert_pem_tiny_der(self):
         """Line 584: tiny cert DER < 10 bytes is skipped."""
         import base64
@@ -3370,6 +3374,58 @@ class TestCovObjectBufferRead(unittest.TestCase):
         n = obj.read(1024, buffer=buf)
         self.assertEqual(n, 11)
         self.assertEqual(buf[:11], b"hello world")
+
+    def test_read_ciphertext_into_buffer(self):
+        from unittest.mock import MagicMock
+
+        obj = _make_ctx().wrap_bio(
+            MemoryBIO(), MemoryBIO(), server_hostname=EXAMPLE_HOST
+        )
+        obj._incoming.write(b"ciphertext")
+        obj._conn = MagicMock()
+        obj._conn.decrypt_incoming.return_value = (b"plaintext", b"")
+        obj._conn.wants_write.return_value = False
+        buffer = bytearray(32)
+        self.assertEqual(obj.read(32, buffer), 9)
+        self.assertEqual(buffer[:9], b"plaintext")
+
+    def test_read_buffered_plaintext_without_buffer(self):
+        from unittest.mock import MagicMock
+
+        obj = _make_ctx().wrap_bio(
+            MemoryBIO(), MemoryBIO(), server_hostname=EXAMPLE_HOST
+        )
+        obj._conn = MagicMock()
+        obj._conn.read_plaintext.return_value = b"buffered"
+        self.assertEqual(obj.read(32), b"buffered")
+
+    def test_feed_decrypt_shutdown_and_pending_bio(self):
+        from unittest.mock import MagicMock
+
+        obj = _make_ctx().wrap_bio(
+            MemoryBIO(), MemoryBIO(), server_hostname=EXAMPLE_HOST
+        )
+        obj._shutdown = True
+        with self.assertRaises(SSLZeroReturnError):
+            obj.feed_decrypt(b"", 32)
+
+        obj._shutdown = False
+        obj._incoming.write(b"pending")
+        obj._conn = MagicMock()
+        obj._conn.decrypt_incoming.return_value = (b"plain", b"")
+        obj._conn.wants_write.return_value = False
+        self.assertEqual(obj.feed_decrypt(b"cipher", 32), b"plain")
+        obj._conn.decrypt_incoming.assert_called_once_with(b"pendingcipher", 32)
+
+    def test_getpeercert_without_peer_certificate(self):
+        from unittest.mock import MagicMock
+
+        obj = _make_ctx().wrap_bio(
+            MemoryBIO(), MemoryBIO(), server_hostname=EXAMPLE_HOST
+        )
+        obj._conn = MagicMock()
+        obj._conn.peer_certificates.return_value = None
+        self.assertIsNone(obj.getpeercert(binary_form=True))
 
 
 class TestCovSocketRecvEOF(unittest.TestCase):
@@ -4456,6 +4512,284 @@ class TestAlreadyBorrowedReproducer(unittest.TestCase):
             f"Got 'Already borrowed' RuntimeError(s): {errors}. "
             f"This indicates the PyO3 PyCell borrow conflict is still present.",
         )
+
+
+class TestTLSStreamSocket(unittest.TestCase):
+    """Exercise the descriptor-free socket wrapper on native CPython."""
+
+    @staticmethod
+    def _make_stream(connected: bool = False) -> tuple[TLSStreamSocket, object]:
+        from unittest.mock import MagicMock
+
+        transport = MagicMock()
+        if connected:
+            transport.getpeername.return_value = ("127.0.0.1", 443)
+        else:
+            transport.getpeername.side_effect = OSError("not connected")
+        stream = TLSStreamSocket(
+            transport,
+            MagicMock(),
+            server_hostname="example.com",
+            do_handshake_on_connect=False,
+        )
+        return stream, transport
+
+    def test_init_connected_and_handshake_failure(self):
+        from unittest.mock import MagicMock, patch
+
+        transport = MagicMock()
+        transport.getpeername.return_value = ("127.0.0.1", 443)
+        tls_object = MagicMock()
+        with patch("rtls._socket.TLSObject", return_value=tls_object):
+            stream = TLSStreamSocket(
+                transport,
+                MagicMock(),
+                server_hostname="example.com",
+                do_handshake_on_connect=True,
+            )
+        self.assertTrue(stream._connected)
+        tls_object.do_handshake.assert_called_once()
+
+        transport = MagicMock()
+        transport.getpeername.return_value = ("127.0.0.1", 443)
+        tls_object = MagicMock()
+        tls_object.do_handshake.side_effect = RuntimeError("handshake failed")
+        with patch("rtls._socket.TLSObject", return_value=tls_object):
+            with self.assertRaises(RuntimeError):
+                TLSStreamSocket(
+                    transport,
+                    MagicMock(),
+                    do_handshake_on_connect=True,
+                )
+        transport.close.assert_called_once()
+
+    def test_connect_and_connect_ex(self):
+        from unittest.mock import MagicMock, patch
+
+        stream, transport = self._make_stream()
+        stream._do_handshake_on_connect = True
+        with patch.object(stream, "_create_sslobj") as create, patch.object(
+            stream, "do_handshake"
+        ) as handshake:
+            stream.connect(("127.0.0.1", 443))
+        transport.connect.assert_called_once_with(("127.0.0.1", 443))
+        create.assert_called_once()
+        handshake.assert_called_once()
+
+        with self.assertRaises(ValueError):
+            stream.connect(("127.0.0.1", 443))
+
+        server, _ = self._make_stream()
+        server._server_side = True
+        with self.assertRaises(ValueError):
+            server.connect(("127.0.0.1", 443))
+        with self.assertRaises(ValueError):
+            server.connect_ex(("127.0.0.1", 443))
+
+        stream, transport = self._make_stream()
+        transport.connect_ex.return_value = 1
+        self.assertEqual(stream.connect_ex(("127.0.0.1", 443)), 1)
+        self.assertFalse(stream._connected)
+
+        stream, transport = self._make_stream()
+        transport.connect_ex.return_value = 0
+        stream._do_handshake_on_connect = True
+        with patch.object(stream, "_create_sslobj") as create, patch.object(
+            stream, "do_handshake"
+        ) as handshake:
+            self.assertEqual(stream.connect_ex(("127.0.0.1", 443)), 0)
+        create.assert_called_once()
+        handshake.assert_called_once()
+        with self.assertRaises(ValueError):
+            stream.connect_ex(("127.0.0.1", 443))
+
+    def test_handshake_read_and_write_retries(self):
+        from unittest.mock import MagicMock, patch
+
+        stream, transport = self._make_stream()
+        tls_object = MagicMock()
+        tls_object.do_handshake.side_effect = [SSLWantReadError("read"), None]
+        stream._sslobj_internal = tls_object
+        transport.recv.return_value = b"ciphertext"
+        stream.do_handshake()
+        self.assertEqual(stream._incoming.read(), b"ciphertext")
+
+        stream, _ = self._make_stream()
+        tls_object = MagicMock()
+        tls_object.do_handshake.side_effect = [SSLWantWriteError("write"), None]
+        stream._sslobj_internal = tls_object
+        stream._outgoing.write(b"handshake")
+        stream.do_handshake()
+        stream._transport.sendall.assert_called_once_with(b"handshake")
+
+        stream, _ = self._make_stream()
+        with patch.object(stream, "_create_sslobj") as create:
+            stream._sslobj_internal = MagicMock()
+            stream.do_handshake()
+        create.assert_not_called()
+
+        stream, _ = self._make_stream()
+        tls_object = MagicMock()
+
+        def create_sslobj():
+            stream._sslobj_internal = tls_object
+
+        with patch.object(stream, "_create_sslobj", side_effect=create_sslobj) as create:
+            stream.do_handshake()
+        create.assert_called_once()
+
+    def test_send_and_sendall(self):
+        from unittest.mock import MagicMock
+
+        stream, transport = self._make_stream()
+        with self.assertRaises(ValueError):
+            stream.send(b"data", 1)
+        self.assertEqual(stream.send(b""), 0)
+        with self.assertRaises(SSLError):
+            stream.send(b"data")
+
+        tls_object = MagicMock()
+        tls_object.write.side_effect = lambda data: min(2, len(data))
+        stream._sslobj_internal = tls_object
+        stream.sendall(b"hello")
+        self.assertEqual(tls_object.write.call_count, 3)
+        transport.sendall.assert_not_called()
+
+        stream._outgoing.write(b"encrypted")
+        self.assertEqual(stream.write(b"x"), 1)
+        transport.sendall.assert_called_once_with(b"encrypted")
+
+    def test_recv_validation_and_buffered_paths(self):
+        from unittest.mock import MagicMock
+
+        stream, _ = self._make_stream()
+        with self.assertRaises(ValueError):
+            stream.recv(10, 1)
+        self.assertEqual(stream.recv(0), b"")
+        with self.assertRaises(SSLError):
+            stream.recv(10)
+
+        tls_object = MagicMock()
+        tls_object._shutdown = True
+        stream._sslobj_internal = tls_object
+        self.assertEqual(stream.recv(10), b"")
+
+        tls_object._shutdown = False
+        tls_object._incoming = MemoryBIO()
+        tls_object.has_pending.return_value = True
+        tls_object.feed_decrypt.return_value = b"plain"
+        self.assertEqual(stream.recv(10), b"plain")
+
+        tls_object.feed_decrypt.side_effect = SSLZeroReturnError("closed")
+        self.assertEqual(stream.recv(10), b"")
+
+    def test_recv_network_paths(self):
+        from unittest.mock import MagicMock
+
+        stream, transport = self._make_stream()
+        tls_object = MagicMock()
+        tls_object._shutdown = False
+        tls_object._incoming = MemoryBIO()
+        tls_object.has_pending.return_value = False
+        tls_object.feed_decrypt.return_value = b"decrypted"
+        stream._sslobj_internal = tls_object
+        transport.recv.return_value = b"ciphertext"
+        self.assertEqual(stream.recv(100), b"decrypted")
+
+        tls_object.feed_decrypt.side_effect = SSLZeroReturnError("closed")
+        self.assertEqual(stream.recv(100), b"")
+
+        tls_object.feed_decrypt.side_effect = None
+        transport.recv.return_value = b""
+        self.assertEqual(stream.recv(100), b"")
+        stream._suppress_ragged_eofs = False
+        with self.assertRaises(SSLEOFError):
+            stream.recv(100)
+
+    def test_read_recv_into_and_pull(self):
+        from unittest.mock import patch
+
+        stream, transport = self._make_stream()
+        with patch.object(stream, "recv", return_value=b"data") as recv:
+            buffer = bytearray(8)
+            self.assertEqual(stream.recv_into(buffer), 4)
+            self.assertEqual(buffer[:4], b"data")
+            self.assertEqual(stream.read(4), b"data")
+            self.assertEqual(stream.read(4, buffer), 4)
+        self.assertEqual(recv.call_count, 3)
+
+        transport.recv.return_value = b"ciphertext"
+        stream._pull_incoming()
+        self.assertEqual(stream._incoming.read(), b"ciphertext")
+        transport.recv.return_value = b""
+        with self.assertRaises(SSLEOFError):
+            stream._pull_incoming()
+
+    def test_metadata_without_and_with_tls_object(self):
+        from unittest.mock import MagicMock
+
+        stream, _ = self._make_stream()
+        self.assertIsNone(stream.getpeercert())
+        self.assertIsNone(stream.cipher())
+        self.assertIsNone(stream.version())
+        self.assertIsNone(stream.selected_alpn_protocol())
+        self.assertEqual(stream.pending(), 0)
+        self.assertIsNone(stream.get_verified_chain())
+        self.assertIsNone(stream.get_unverified_chain())
+
+        tls_object = MagicMock()
+        tls_object.getpeercert.return_value = {"subject": ()}
+        tls_object.cipher.return_value = ("cipher", "TLSv1.3", 128)
+        tls_object.version.return_value = "TLSv1.3"
+        tls_object.selected_alpn_protocol.return_value = "h2"
+        tls_object.pending.return_value = 3
+        tls_object.get_verified_chain.return_value = ["verified"]
+        tls_object.get_unverified_chain.return_value = ["unverified"]
+        stream._sslobj_internal = tls_object
+        self.assertEqual(stream.getpeercert(), {"subject": ()})
+        self.assertEqual(stream.cipher(), ("cipher", "TLSv1.3", 128))
+        self.assertEqual(stream.version(), "TLSv1.3")
+        self.assertEqual(stream.selected_alpn_protocol(), "h2")
+        self.assertEqual(stream.pending(), 3)
+        self.assertEqual(stream.get_verified_chain(), ["verified"])
+        self.assertEqual(stream.get_unverified_chain(), ["unverified"])
+
+    def test_unwrap_shutdown_close_and_properties(self):
+        from unittest.mock import MagicMock
+
+        stream, transport = self._make_stream()
+        self.assertIs(stream.unwrap(), transport)
+
+        tls_object = MagicMock()
+        stream._sslobj_internal = tls_object
+        stream._outgoing.write(b"close-notify")
+        self.assertIs(stream.unwrap(), transport)
+        tls_object.unwrap.assert_called_once()
+        transport.sendall.assert_called_once_with(b"close-notify")
+        self.assertIsNone(stream.sslobj)
+
+        tls_object = MagicMock()
+        stream._sslobj_internal = tls_object
+        stream.shutdown(socket.SHUT_RDWR)
+        tls_object.unwrap.assert_called_once()
+        transport.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+
+        tls_object = MagicMock()
+        tls_object.unwrap.side_effect = RuntimeError("ignore on close")
+        stream._sslobj_internal = tls_object
+        stream.close()
+        transport.close.assert_called_once()
+        stream.close()
+        transport.close.assert_called_once()
+
+        self.assertIs(stream.context, stream._rtls_context)
+        self.assertFalse(stream.server_side)
+        self.assertEqual(stream.server_hostname, "example.com")
+        self.assertIsNone(stream._sslobj)
+        transport.marker = "delegated"
+        self.assertEqual(stream.marker, "delegated")
+        self.assertIs(stream.__enter__(), stream)
+        stream.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

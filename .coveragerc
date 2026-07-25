@@ -1,6 +1,8 @@
 [run]
 source =
     rtls
+omit =
+    */rtls/_stdlib.py
 # Needed for Python 3.11 and lower
 disable_warnings = no-sysmon
 

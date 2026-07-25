@@ -45,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@2e3e4b15a884dc73a63f962bff250a855150a234
         with:
           python-version: ${{ matrix.python_version }}
           allow-prereleases: true
@@ -70,6 +70,85 @@ jobs:
           path: ".coverage.*"
           include-hidden-files: true
           if-no-files-found: error
+
+  wasi-sidecar:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+      - name: Install WASI SDK
+        run: |
+          curl -fL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz -o /tmp/wasi-sdk.tar.gz
+          tar -xf /tmp/wasi-sdk.tar.gz -C /tmp
+          rustup toolchain install 1.97.0 --profile minimal --target wasm32-wasip1
+      - name: Build WASI extension sidecar
+        env:
+          PYO3_NO_PYTHON: 1
+          CARGO_TARGET_WASM32_WASIP1_LINKER: /tmp/wasi-sdk-33.0-x86_64-linux/bin/clang
+          CC_wasm32_wasip1: /tmp/wasi-sdk-33.0-x86_64-linux/bin/clang
+          AR_wasm32_wasip1: /tmp/wasi-sdk-33.0-x86_64-linux/bin/ar
+          CFLAGS_wasm32_wasip1: --target=wasm32-wasip1 --sysroot=/tmp/wasi-sdk-33.0-x86_64-linux/share/wasi-sysroot -fPIC
+          RUSTFLAGS: >-
+            -C link-arg=-L/tmp/wasi-sdk-33.0-x86_64-linux/share/wasi-sysroot/lib/wasm32-wasip1
+            -C link-self-contained=no
+            -C link-arg=-Wl,--experimental-pic
+            -C link-arg=-Wl,--shared
+            -C link-arg=-Wl,--allow-undefined
+            -C relocation-model=pic
+        run: |
+          cargo +1.97.0 build --manifest-path rust/Cargo.toml --target wasm32-wasip1 --release
+          mkdir -p dist
+          cp rust/target/wasm32-wasip1/release/_rustls.wasm dist/_rustls.abi3.so
+          sha256sum dist/_rustls.abi3.so
+          test "$(od -An -tx1 -N4 dist/_rustls.abi3.so | tr -d ' \n')" = "0061736d"
+          /tmp/wasi-sdk-33.0-x86_64-linux/bin/llvm-objdump -h dist/_rustls.abi3.so | grep dylink.0
+      - name: Upload WASI extension sidecar
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: wasi-sidecar
+          path: dist/_rustls.abi3.so
+
+  smoke_wasi:
+    runs-on: ubuntu-latest
+    name: WASI Smoke Tests
+    timeout-minutes: 20
+    needs: wasi-sidecar
+    steps:
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+      - uses: actions/setup-python@2e3e4b15a884dc73a63f962bff250a855150a234
+        with:
+          python-version: "3.12"
+      - name: Download WASI extension sidecar
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: wasi-sidecar
+          path: .nox/wasi-prebuilt
+      - name: Install nox
+        run: python -m pip install nox
+      - name: Run Smoke Test
+        run: nox -s wasi
+        env:
+          RTLS_WASI_SIDECAR: ${{ github.workspace }}/.nox/wasi-prebuilt/_rustls.abi3.so
+      - name: Hash WASI binaries
+        if: always()
+        run: |
+          for file in \
+            src/rtls/_wasi/_rustls.abi3.so \
+            .nox/wasi-artifacts/smoke.wasm \
+            .nox/wasi-cache/wasmtime-v47.0.1-x86_64-linux/wasmtime
+          do
+            test ! -f "$file" || sha256sum "$file"
+          done
+      - name: Upload WASI binaries
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: wasi-smoke-binaries-${{ github.run_attempt }}
+          path: |
+            src/rtls/_wasi/_rustls.abi3.so
+            .nox/wasi-artifacts/smoke.wasm
+          include-hidden-files: true
+          if-no-files-found: warn
 
   coverage:
     if: always()
@@ -110,6 +189,8 @@ jobs:
     needs:
       - test
       - lint
+      - smoke_wasi
+      - wasi-sidecar
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +226,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+      - name: Download WASI extension sidecar
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: wasi-sidecar
+          path: src/rtls/_wasi
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python_version }}
@@ -435,6 +521,8 @@ jobs:
     needs:
       - test
       - lint
+      - smoke_wasi
+      - wasi-sidecar
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -443,6 +531,11 @@ jobs:
         python_version: [ '3.10', '3.13t', '3.14t' ]
     steps:
       - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+      - name: Download WASI extension sidecar
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: wasi-sidecar
+          path: src/rtls/_wasi
       - uses: actions/setup-python@v6
         if: matrix.target != 'aarch64'
         with:
@@ -485,6 +578,8 @@ jobs:
     needs:
       - test
       - lint
+      - smoke_wasi
+      - wasi-sidecar
     runs-on: macos-14
     strategy:
       fail-fast: false
@@ -493,6 +588,11 @@ jobs:
         python_version: [ '3.10', '3.13t', '3.14t' ]
     steps:
       - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+      - name: Download WASI extension sidecar
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: wasi-sidecar
+          path: src/rtls/_wasi
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python_version }}
@@ -515,9 +615,16 @@ jobs:
     needs:
       - test
       - lint
+      - smoke_wasi
+      - wasi-sidecar
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+      - name: Download WASI extension sidecar
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: wasi-sidecar
+          path: src/rtls/_wasi
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:

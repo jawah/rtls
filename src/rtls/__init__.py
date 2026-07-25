@@ -12,6 +12,13 @@ Usage::
 
 from __future__ import annotations
 
+import sys
+
+if sys.platform == "wasi":
+    from ._wasi import _rustls as _rustls
+else:
+    from . import _rustls as _rustls
+
 from ._bio import MemoryBIO
 from ._certificate import TLSCertificate as Certificate
 from ._constants import (
@@ -143,7 +150,7 @@ from ._utils import (
     match_hostname,
 )
 
-__version__ = "2026.5.30"
+__version__ = "2026.7.25"
 
 __all__ = [
     # Classes

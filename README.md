@@ -7,7 +7,7 @@ Tired of waiting half a decade for a solid and up-to-date TLS experience, shippi
 Then `rtls` is made for you.
 
 It's a drop-in replacement for the `ssl` stdlib!
-Support CPython 3.7 onward. Including freethreaded.
+Support CPython 3.7 onward. Including freethreaded. Even on WASI.
 
 ### Getting Started
 
@@ -57,6 +57,22 @@ async def main():
 asyncio.run(main())
 ```
 
+### WASI
+
+Native wheels include a ring-backed WebAssembly extension sidecar for
+`componentize-py`. On WASI, `rtls` selects that sidecar automatically; on all
+other platforms it continues to use the native AWS-LC extension. Application
+code does not need a WASI-specific import path.
+
+Install `rtls` alongside the application dependencies before componentizing!
+
+The WASI provider currently omits ECH and post-quantum key exchange.
+Run the self-contained real-network smoke test with:
+
+```
+nox -s wasi
+```
+
 ### Feature Parity with stdlib
 
 rtls re-exports **93 public names** matching the `ssl` module API. The table below summarizes
@@ -72,7 +88,7 @@ coverage across the main areas.
 
 ### Disclaimer
 
-This project is in an early stage. The public API is stable, we do not plan to diverge from stdlib.
+This project is in a beta stage. The public API is stable, we do not plan to diverge from stdlib.
 It's not pure Python, so you'll have either a pre-built wheel compatible with your platform or build
 from the sources by yourself.
 
@@ -82,7 +98,7 @@ under MIT as we always do. Rustls is also permissively licensed.
 Right now we deliberately focus on the client side. PRs are accepted to help us finalize/improve the server side.
 
 - We are not inclined to enable FIPS mode via aws-lc-rs for the moment, however, it's on our roadmap.
-- Do not open issue about "JA fingerprint", "Browser impersonator" or alike, we'll most likely close them on the spot. We are not interested in pursing this.
+- Do not open issue about "JA fingerprint", "Browser impersonator" or alike, we'll most likely close them on the spot. We are not interested in pursing this here. See [utls](https://github.com/jawah/utls) instead.
 - PyPy is not going to be supported, unfortunately.
 
 It's not faster than the stdlib. Expect roughly 5 to 10% slower. For example, a quick benchmark reveal that ssl stdlib can reach 456 MB/s raw throughput on my modest laptop while our

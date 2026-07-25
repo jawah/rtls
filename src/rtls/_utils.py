@@ -210,9 +210,9 @@ def _match_hostname_pattern(hostname: str, pattern: str) -> bool:
 def RAND_bytes(num: int) -> bytes:
     """Generate num cryptographically secure random bytes."""
     try:
-        from ._rustls import rand_bytes
+        from . import _rustls
 
-        return rand_bytes(num)
+        return _rustls.rand_bytes(num)
     except ImportError:
         return os.urandom(num)
 

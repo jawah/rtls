@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes};
+#[cfg(not(target_os = "wasi"))]
 use rustls::client::EchStatus;
 use rustls::{ClientConnection, ServerConnection};
 use std::io::{Cursor, Read, Write};
@@ -266,6 +267,7 @@ impl RustlsClientConnection {
 
     /// Get the ECH (Encrypted Client Hello) status as a string.
     /// Returns one of: "not_offered", "grease", "offered", "accepted", "rejected"
+    #[cfg(not(target_os = "wasi"))]
     fn ech_status(&self, py: Python<'_>) -> &'static str {
         let inner = &self.inner;
         py.detach(|| match inner.lock().unwrap().conn.ech_status() {
