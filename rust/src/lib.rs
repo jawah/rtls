@@ -21,6 +21,8 @@ fn _rustls(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_certificate_dict, m)?)?;
     m.add_function(wrap_pyfunction!(rustls_version, m)?)?;
     m.add_function(wrap_pyfunction!(aws_lc_rs_version, m)?)?;
+    m.add_function(wrap_pyfunction!(crypto_provider, m)?)?;
+    m.add_function(wrap_pyfunction!(crypto_provider_version, m)?)?;
     m.add_function(wrap_pyfunction!(rand_bytes, m)?)?;
     Ok(())
 }
@@ -39,6 +41,24 @@ fn aws_lc_rs_version() -> String {
     env!("AWS_LC_RS_VERSION").to_string()
 }
 
+#[pyfunction]
+fn crypto_provider() -> &'static str {
+    if cfg!(target_os = "wasi") {
+        "ring"
+    } else {
+        "aws-lc-rs"
+    }
+}
+
+#[pyfunction]
+fn crypto_provider_version() -> String {
+    if cfg!(target_os = "wasi") {
+        env!("RING_VERSION").to_string()
+    } else {
+        env!("AWS_LC_RS_VERSION").to_string()
+    }
+}
+
 /// Generate cryptographically secure random bytes.
 /// GIL is released during the CSPRNG fill.
 #[pyfunction]
@@ -46,10 +66,11 @@ fn rand_bytes(py: Python<'_>, n: usize) -> PyResult<Py<PyAny>> {
     use pyo3::types::PyBytes;
     let mut buf = vec![0u8; n];
     py.detach(|| {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .secure_random
-            .fill(&mut buf)
-            .map_err(|_| ())
+        #[cfg(target_os = "wasi")]
+        let provider = rustls::crypto::ring::default_provider();
+        #[cfg(not(target_os = "wasi"))]
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.secure_random.fill(&mut buf).map_err(|_| ())
     })
     .map_err(|_| pyo3::exceptions::PyOSError::new_err("Failed to generate random bytes"))?;
     Ok(PyBytes::new(py, &buf).into())

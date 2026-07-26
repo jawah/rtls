@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import socket
-import ssl as _stdlib_ssl
+import sys
 from typing import Any, Callable
 
 from ._bio import MemoryBIO
 from ._ciphers import get_default_ciphers, parse_cipher_string
 from ._constants import (
+    _HAS_ECH,
     CERT_NONE,
     CERT_REQUIRED,
     OP_ALL,
@@ -21,6 +22,10 @@ from ._constants import (
     VerifyMode,
 )
 from ._exceptions import SSLError
+from ._stdlib import ssl as _stdlib_ssl
+
+if sys.platform == "wasi":
+    import wassima  # noqa: F401
 
 
 class TLSContext(_stdlib_ssl.SSLContext):
@@ -50,9 +55,9 @@ class TLSContext(_stdlib_ssl.SSLContext):
         self._protocol = protocol
 
         # Create the Rust config builder
-        from ._rustls import RustlsConfigBuilder
+        from . import _rustls
 
-        self._builder = RustlsConfigBuilder()
+        self._builder = _rustls.RustlsConfigBuilder()
 
         # Internal state tracking
         self._verify_mode = CERT_NONE
@@ -95,12 +100,17 @@ class TLSContext(_stdlib_ssl.SSLContext):
         server_hostname: str | None = None,
     ) -> Any:
         """Wrap a socket with TLS, returning an TLSSocket."""
-        from ._socket import TLSSocket
+        from ._socket import TLSSocket, TLSStreamSocket
 
         if not server_side and self._check_hostname and not server_hostname:
             raise ValueError("check_hostname requires server_hostname")
 
-        return TLSSocket(
+        socket_type = (
+            TLSStreamSocket
+            if sys.platform == "wasi" or not isinstance(sock, socket.socket)
+            else TLSSocket
+        )
+        return socket_type(
             sock=sock,
             context=self,
             server_side=server_side,
@@ -415,11 +425,11 @@ class TLSContext(_stdlib_ssl.SSLContext):
 
         result: list[dict] = []
         try:
-            from ._rustls import parse_certificate_dict
+            from . import _rustls
 
             for der in self._builder.get_root_certs_der():
                 try:
-                    result.append(parse_certificate_dict(der))
+                    result.append(_rustls.parse_certificate_dict(der))
                 except Exception:
                     pass
         except ImportError:
@@ -446,52 +456,54 @@ class TLSContext(_stdlib_ssl.SSLContext):
         """No-op — NPN is not supported by rustls."""
         pass
 
-    def set_ech_configs(self, ech_config_list: bytes) -> TLSContext:
-        """Create a **new** TLSContext clone with ECH enabled."""
-        if not isinstance(ech_config_list, (bytes, bytearray, memoryview)):
-            raise TypeError(
-                f"expected bytes-like object, got {type(ech_config_list).__name__}"
-            )
+    if _HAS_ECH:
 
-        # 1. Create a blank TLSContext (same protocol as self).
-        clone = TLSContext.__new__(TLSContext, self._protocol)
-        clone.__init__(self._protocol)  # type: ignore[misc]
+        def set_ech_configs(self, ech_config_list: bytes) -> TLSContext:
+            """Create a **new** TLSContext clone with ECH enabled."""
+            if not isinstance(ech_config_list, (bytes, bytearray, memoryview)):
+                raise TypeError(
+                    f"expected bytes-like object, got {type(ech_config_list).__name__}"
+                )
 
-        # 2. Replace the blank builder with a deep copy of ours.
-        clone._builder = self._builder.clone_builder()
+            # 1. Create a blank TLSContext (same protocol as self).
+            clone = TLSContext.__new__(TLSContext, self._protocol)
+            clone.__init__(self._protocol)  # type: ignore[misc]
 
-        # 3. Copy all Python-side state.
-        clone._verify_mode = self._verify_mode
-        clone._check_hostname = self._check_hostname
-        clone._options = self._options
-        clone._minimum_version = self._minimum_version
-        clone._maximum_version = self._maximum_version
-        clone._alpn_protocols = list(self._alpn_protocols)
-        clone._ciphers_string = self._ciphers_string
-        clone._sni_callback = self._sni_callback
-        clone._post_handshake_auth = self._post_handshake_auth
-        clone._keylog_filename = self._keylog_filename
-        clone._cert_chain_loaded = self._cert_chain_loaded
-        clone._ca_certs_loaded = self._ca_certs_loaded
-        clone._num_ca_certs = self._num_ca_certs
-        clone._verify_flags = self._verify_flags
-        clone._protocol = self._protocol
+            # 2. Replace the blank builder with a deep copy of ours.
+            clone._builder = self._builder.clone_builder()
 
-        # 4. Inject ECH into the *clone* only.
-        clone._builder.set_ech_configs(bytes(ech_config_list))
+            # 3. Copy all Python-side state.
+            clone._verify_mode = self._verify_mode
+            clone._check_hostname = self._check_hostname
+            clone._options = self._options
+            clone._minimum_version = self._minimum_version
+            clone._maximum_version = self._maximum_version
+            clone._alpn_protocols = list(self._alpn_protocols)
+            clone._ciphers_string = self._ciphers_string
+            clone._sni_callback = self._sni_callback
+            clone._post_handshake_auth = self._post_handshake_auth
+            clone._keylog_filename = self._keylog_filename
+            clone._cert_chain_loaded = self._cert_chain_loaded
+            clone._ca_certs_loaded = self._ca_certs_loaded
+            clone._num_ca_certs = self._num_ca_certs
+            clone._verify_flags = self._verify_flags
+            clone._protocol = self._protocol
 
-        # 5. ECH is inherently TLS 1.3 only — forcibly disable TLS 1.2.
-        from ._constants import TLSVersion
+            # 4. Inject ECH into the *clone* only.
+            clone._builder.set_ech_configs(bytes(ech_config_list))
 
-        clone._minimum_version = TLSVersion.TLSv1_3
-        clone._builder.set_min_version(int(TLSVersion.TLSv1_3))
+            # 5. ECH is inherently TLS 1.3 only — forcibly disable TLS 1.2.
+            from ._constants import TLSVersion
 
-        return clone
+            clone._minimum_version = TLSVersion.TLSv1_3
+            clone._builder.set_min_version(int(TLSVersion.TLSv1_3))
 
-    @property
-    def ech_enabled(self) -> bool:
-        """Return True if ECH configs have been set."""
-        return self._builder.has_ech()
+            return clone
+
+        @property
+        def ech_enabled(self) -> bool:
+            """Return True if ECH configs have been set."""
+            return self._builder.has_ech()
 
     def _apply_version_options(self) -> None:
         """Translate OP_NO_* option flags into min/max version settings."""

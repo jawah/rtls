@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import errno
 import socket
-import ssl as _stdlib_ssl
 from typing import TYPE_CHECKING, Any
 
 from ._bio import MemoryBIO
 from ._certificate import TLSCertificate
-from ._constants import SSL_ERROR_WANT_READ
+from ._constants import _HAS_ECH, SSL_ERROR_WANT_READ
 from ._exceptions import (
     SSLEOFError,
     SSLError,
@@ -16,6 +15,7 @@ from ._exceptions import (
     SSLZeroReturnError,
 )
 from ._object import TLSObject
+from ._stdlib import ssl as _stdlib_ssl
 
 if TYPE_CHECKING:
     from ._context import TLSContext
@@ -399,7 +399,7 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
             try:
                 self._sslobj_internal.unwrap()
                 self._flush_outgoing()
-            except Exception:
+            except Exception:  # Defensive:
                 pass
             self._sslobj_internal = None
         socket.socket._real_close(self)  # type: ignore[attr-defined]
@@ -445,12 +445,14 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
             return None
         return self._sslobj_internal.get_unverified_chain()
 
-    @property
-    def ech_status(self) -> str:
-        """Return the ECH status string. See TLSObject.ech_status."""
-        if self._sslobj_internal is None:
-            return "not_offered"
-        return self._sslobj_internal.ech_status
+    if _HAS_ECH:
+
+        @property
+        def ech_status(self) -> str:
+            """Return the ECH status string. See TLSObject.ech_status."""
+            if self._sslobj_internal is None:
+                return "not_offered"
+            return self._sslobj_internal.ech_status
 
     def recvfrom(self, *args: Any, **kwargs: Any) -> Any:
         raise ValueError("recvfrom not allowed on TLS sockets")
@@ -487,3 +489,247 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
             f" server_hostname={self._server_hostname!r}"
             f" peer={peer}>"
         )
+
+
+class TLSStreamSocket:
+    """TLS over a socket-compatible byte stream without file descriptors."""
+
+    def __init__(
+        self,
+        sock: Any,
+        context: TLSContext,
+        server_side: bool = False,
+        server_hostname: str | None = None,
+        do_handshake_on_connect: bool = True,
+        suppress_ragged_eofs: bool = True,
+    ) -> None:
+        self._transport = sock
+        self._rtls_context = context
+        self._server_side = server_side
+        self._server_hostname = server_hostname
+        self._do_handshake_on_connect = do_handshake_on_connect
+        self._suppress_ragged_eofs = suppress_ragged_eofs
+        self._incoming = MemoryBIO()
+        self._outgoing = MemoryBIO()
+        self._sslobj_internal: TLSObject | None = None
+        self._closed = False
+
+        try:
+            sock.getpeername()
+        except OSError:
+            self._connected = False
+        else:
+            self._connected = True
+
+        if self._connected:
+            self._create_sslobj()
+            if self._do_handshake_on_connect:
+                try:
+                    self.do_handshake()
+                except BaseException:
+                    self.close()
+                    raise
+
+    def _create_sslobj(self) -> None:
+        self._sslobj_internal = TLSObject(
+            context=self._rtls_context,
+            incoming=self._incoming,
+            outgoing=self._outgoing,
+            server_side=self._server_side,
+            server_hostname=self._server_hostname,
+        )
+
+    def connect(self, addr: Any) -> None:
+        if self._server_side:
+            raise ValueError("can't connect in server-side mode")
+        if self._connected:
+            raise ValueError("attempt to connect already-connected SSLSocket!")
+        self._transport.connect(addr)
+        self._connected = True
+        self._create_sslobj()
+        if self._do_handshake_on_connect:
+            self.do_handshake()
+
+    def connect_ex(self, addr: Any) -> int:
+        if self._server_side:
+            raise ValueError("can't connect in server-side mode")
+        if self._connected:
+            raise ValueError("attempt to connect already-connected SSLSocket!")
+        result = self._transport.connect_ex(addr)
+        if result == 0:
+            self._connected = True
+            self._create_sslobj()
+            if self._do_handshake_on_connect:
+                self.do_handshake()
+        return result
+
+    def do_handshake(self) -> None:
+        if self._sslobj_internal is None:
+            self._create_sslobj()
+        while True:
+            try:
+                self._sslobj_internal.do_handshake()
+                self._flush_outgoing()
+                return
+            except SSLWantReadError:
+                self._flush_outgoing()
+                self._pull_incoming()
+            except SSLWantWriteError:
+                self._flush_outgoing()
+
+    def send(self, data: bytes, flags: int = 0) -> int:
+        if flags:
+            raise ValueError("non-zero flags not allowed on TLS sockets")
+        if not data:
+            return 0
+        if self._sslobj_internal is None:
+            raise SSLError("SSL handshake not done")
+        written = self._sslobj_internal.write(data)
+        self._flush_outgoing()
+        return written
+
+    def sendall(self, data: bytes, flags: int = 0) -> None:
+        sent = 0
+        while sent < len(data):
+            sent += self.send(data[sent:], flags)
+
+    def recv(self, buflen: int = _DEFAULT_BUFFER_SIZE, flags: int = 0) -> bytes:
+        if flags:
+            raise ValueError("non-zero flags not allowed on TLS sockets")
+        if buflen == 0:
+            return b""
+        obj = self._sslobj_internal
+        if obj is None:
+            raise SSLError("SSL handshake not done")
+        if obj._shutdown:
+            return b""
+
+        while True:
+            if obj.has_pending() or obj._incoming.pending:
+                try:
+                    data = obj.feed_decrypt(b"", buflen)
+                except SSLZeroReturnError:
+                    return b""
+                if data:
+                    return data
+
+            self._flush_outgoing()
+            chunk = self._transport.recv(_SOCKET_READ_BUFFER_SIZE)
+            if not chunk:
+                if self._suppress_ragged_eofs:
+                    return b""
+                raise SSLEOFError("EOF occurred in violation of protocol")
+            try:
+                data = obj.feed_decrypt(chunk, buflen)
+            except SSLZeroReturnError:
+                return b""
+            if data:
+                return data
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        data = self.recv(nbytes or len(buffer), flags)
+        buffer[: len(data)] = data
+        return len(data)
+
+    def read(self, n: int = _DEFAULT_BUFFER_SIZE, buffer: Any = None) -> bytes | int:
+        if buffer is None:
+            return self.recv(n)
+        return self.recv_into(buffer, n)
+
+    def write(self, data: bytes) -> int:
+        return self.send(data)
+
+    def _flush_outgoing(self) -> None:
+        data = self._outgoing.read()
+        if data:
+            self._transport.sendall(data)
+
+    def _pull_incoming(self) -> None:
+        data = self._transport.recv(_SOCKET_READ_BUFFER_SIZE)
+        if not data:
+            raise SSLEOFError("EOF on underlying transport")
+        self._incoming.write(data)
+
+    def getpeercert(self, binary_form: bool = False) -> dict | bytes | None:
+        if self._sslobj_internal is None:
+            return None
+        return self._sslobj_internal.getpeercert(binary_form)
+
+    def cipher(self) -> tuple[str, str, int] | None:
+        return self._sslobj_internal.cipher() if self._sslobj_internal else None
+
+    def version(self) -> str | None:
+        return self._sslobj_internal.version() if self._sslobj_internal else None
+
+    def selected_alpn_protocol(self) -> str | None:
+        if self._sslobj_internal is None:
+            return None
+        return self._sslobj_internal.selected_alpn_protocol()
+
+    def pending(self) -> int:
+        return self._sslobj_internal.pending() if self._sslobj_internal else 0
+
+    def unwrap(self) -> Any:
+        if self._sslobj_internal is not None:
+            self._sslobj_internal.unwrap()
+            self._flush_outgoing()
+            self._sslobj_internal = None
+        return self._transport
+
+    def shutdown(self, how: int) -> None:
+        if self._sslobj_internal is not None:
+            self._sslobj_internal.unwrap()
+            self._flush_outgoing()
+        self._transport.shutdown(how)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._sslobj_internal is not None:
+            try:
+                self._sslobj_internal.unwrap()
+                self._flush_outgoing()
+            except Exception:
+                pass
+            self._sslobj_internal = None
+        self._transport.close()
+
+    def get_verified_chain(self) -> list[TLSCertificate] | None:
+        if self._sslobj_internal is None:
+            return None
+        return self._sslobj_internal.get_verified_chain()
+
+    def get_unverified_chain(self) -> list[TLSCertificate] | None:
+        if self._sslobj_internal is None:
+            return None
+        return self._sslobj_internal.get_unverified_chain()
+
+    @property
+    def context(self) -> TLSContext:
+        return self._rtls_context
+
+    @property
+    def server_side(self) -> bool:
+        return self._server_side
+
+    @property
+    def server_hostname(self) -> str | None:
+        return self._server_hostname
+
+    @property
+    def _sslobj(self) -> TLSObject | None:
+        return self._sslobj_internal
+
+    @property
+    def sslobj(self) -> TLSObject | None:
+        return self._sslobj_internal
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._transport, name)
+
+    def __enter__(self) -> TLSStreamSocket:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from ._bio import MemoryBIO
 from ._certificate import TLSCertificate
 from ._constants import (
+    _HAS_ECH,
     CERT_NONE,
     SSL_ERROR_WANT_READ,
 )
@@ -302,9 +303,9 @@ class TLSObject:
             return der_bytes
 
         try:
-            from ._rustls import parse_certificate_dict
+            from . import _rustls
 
-            return parse_certificate_dict(der_bytes)
+            return _rustls.parse_certificate_dict(der_bytes)
         except ImportError:
             return {}
 
@@ -436,21 +437,23 @@ class TLSObject:
         """Whether the TLS session was reused. Always False for now."""
         return False
 
-    @property
-    def ech_status(self) -> str:
-        """Return the ECH (Encrypted Client Hello) status string.
+    if _HAS_ECH:
 
-        Possible values:
-          - "not_offered": ECH was not configured
-          - "grease": GREASE ECH was sent (anti-ossification)
-          - "offered": ECH was offered but handshake not complete
-          - "accepted": ECH was accepted by the server
-          - "rejected": ECH was rejected by the server
-        """
-        if self._conn is None:
-            return "not_offered"
-        try:
-            return self._conn.ech_status()
-        except AttributeError:
-            # Server connections don't have ech_status
-            return "not_offered"
+        @property
+        def ech_status(self) -> str:
+            """Return the ECH (Encrypted Client Hello) status string.
+
+            Possible values:
+              - "not_offered": ECH was not configured
+              - "grease": GREASE ECH was sent (anti-ossification)
+              - "offered": ECH was offered but handshake not complete
+              - "accepted": ECH was accepted by the server
+              - "rejected": ECH was rejected by the server
+            """
+            if self._conn is None:
+                return "not_offered"
+            try:
+                return self._conn.ech_status()
+            except AttributeError:
+                # Server connections don't have ech_status
+                return "not_offered"

@@ -222,14 +222,17 @@ ALERT_DESCRIPTION_UNSUPPORTED_EXTENSION = (
 CHANNEL_BINDING_TYPES = ["tls-unique"]
 
 try:
-    from rtls._rustls import aws_lc_rs_version as _aws_lc_rs_version
-    from rtls._rustls import rustls_version as _rustls_version
+    from . import _rustls
 
-    _RUSTLS_VERSION = _rustls_version()
-    _AWS_LC_RS_VERSION = _aws_lc_rs_version()
+    _RUSTLS_VERSION = _rustls.rustls_version()
+    _CRYPTO_PROVIDER = _rustls.crypto_provider()
+    _CRYPTO_PROVIDER_VERSION = _rustls.crypto_provider_version()
 except ImportError:
     _RUSTLS_VERSION = "0.0.0"
-    _AWS_LC_RS_VERSION = "0.0.0"
+    _CRYPTO_PROVIDER = "unknown"
+    _CRYPTO_PROVIDER_VERSION = "0.0.0"
+
+_HAS_ECH = _CRYPTO_PROVIDER == "aws-lc-rs"
 
 # Parse the rustls semver components for VERSION_NUMBER and VERSION_INFO.
 _rustls_parts = [int(x) for x in _RUSTLS_VERSION.split(".")]
@@ -237,8 +240,10 @@ _rustls_major = _rustls_parts[0] if len(_rustls_parts) > 0 else 0
 _rustls_minor = _rustls_parts[1] if len(_rustls_parts) > 1 else 0
 _rustls_patch = _rustls_parts[2] if len(_rustls_parts) > 2 else 0
 
-# OPENSSL_VERSION: report as "Rustls X.Y.Z aws-lc-rs A.B.C".
-OPENSSL_VERSION = f"Rustls {_RUSTLS_VERSION} — aws-lc-rs {_AWS_LC_RS_VERSION}"
+# OPENSSL_VERSION identifies the crypto provider selected for this target.
+OPENSSL_VERSION = (
+    f"Rustls {_RUSTLS_VERSION} — {_CRYPTO_PROVIDER} {_CRYPTO_PROVIDER_VERSION}"
+)
 
 # OPENSSL_VERSION_NUMBER: encode rustls semver in OpenSSL's 0xMNNFFPPS layout.
 # M=major, NN=minor, FF=fix, PP=patch(0), S=status(0xf=release).

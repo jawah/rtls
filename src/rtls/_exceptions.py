@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import ssl as _ssl
 from typing import Any
+
+from ._stdlib import ssl as _ssl
 
 
 class SSLError(_ssl.SSLError):

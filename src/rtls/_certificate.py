@@ -30,9 +30,9 @@ class TLSCertificate:
             return self._parsed_cache
 
         try:
-            from ._rustls import parse_certificate_dict
+            from . import _rustls
 
-            self._parsed_cache = parse_certificate_dict(self._der_bytes)
+            self._parsed_cache = _rustls.parse_certificate_dict(self._der_bytes)
         except ImportError:
             # Fallback: return minimal dict if Rust module not available
             self._parsed_cache = {}

@@ -1,8 +1,15 @@
 use pyo3::prelude::*;
-use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
+use rustls::client::EchMode;
+#[cfg(not(target_os = "wasi"))]
+use rustls::client::{EchConfig, EchGreaseConfig};
+#[cfg(not(target_os = "wasi"))]
 use rustls::crypto::aws_lc_rs as provider;
+#[cfg(target_os = "wasi")]
+use rustls::crypto::ring as provider;
 use rustls::crypto::SupportedKxGroup;
-use rustls::pki_types::{CertificateDer, EchConfigListBytes, PrivateKeyDer, ServerName};
+#[cfg(not(target_os = "wasi"))]
+use rustls::pki_types::EchConfigListBytes;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedCipherSuite};
 use std::io::{BufReader, Write};
 use std::sync::Arc;
@@ -63,8 +70,16 @@ static PREFERRED_CIPHER_SUITES: &[SupportedCipherSuite] = &[
 /// X25519MLKEM768 first (post-quantum hybrid), then X25519, then the
 /// NIST curves.  Placing MLKEM first also means rustls will include a
 /// key share for it in the initial ClientHello.
+#[cfg(not(target_os = "wasi"))]
 static PREFERRED_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     provider::kx_group::X25519MLKEM768,
+    provider::kx_group::X25519,
+    provider::kx_group::SECP256R1,
+    provider::kx_group::SECP384R1,
+];
+
+#[cfg(target_os = "wasi")]
+static PREFERRED_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     provider::kx_group::X25519,
     provider::kx_group::SECP256R1,
     provider::kx_group::SECP384R1,
@@ -498,6 +513,7 @@ impl RustlsConfigBuilder {
     /// ECH (both GREASE and Enable) is inherently TLS 1.3 only.  Rather than
     /// silently breaking TLS 1.2 servers, we only activate GREASE when TLS 1.2
     /// has been explicitly disabled by the caller.
+    #[cfg(not(target_os = "wasi"))]
     fn resolve_ech_mode(&self) -> Result<Option<EchMode>, String> {
         let hpke_suites = provider::hpke::ALL_SUPPORTED_SUITES;
 
@@ -525,6 +541,14 @@ impl RustlsConfigBuilder {
             let grease_config = EchGreaseConfig::new(*suite, pub_key);
             Ok(Some(EchMode::Grease(grease_config)))
         }
+    }
+
+    #[cfg(target_os = "wasi")]
+    fn resolve_ech_mode(&self) -> Result<Option<EchMode>, String> {
+        if self.ech_config_list.is_some() {
+            return Err("ECH is unavailable with the ring crypto provider".to_string());
+        }
+        Ok(None)
     }
 
     /// Pure-Rust client config builder — no Python GIL needed.

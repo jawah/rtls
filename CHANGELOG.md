@@ -1,6 +1,19 @@
 Release History
 ===============
 
+2026.7.25
+---------
+
+- Added support for WASI as the first TLS backend that match stdlib `ssl` behavior.
+  Tested with componentize-py 0.25+ under wasmtime 47. A mere `pip install rtls` is
+  sufficient. As the backend AWS-LC cannot target WASIp1 we made our WASI target
+  Ring instead for Rustls.
+  As wasi-tls is rather unusable at the moment for a mature http client such as urllib3-future
+  we decided to deliver this TLS engine to WASI as a way to escape current known limitations.
+  Beware that if your WASM runtime have an unsafe rng implementation, you should not use it
+  in production.
+- Updated aws-lc-rs v1.17.1 to v1.17.3
+
 2026.5.30
 ---------
 
