@@ -40,6 +40,8 @@ impl TlsError {
 struct ClientInner {
     conn: ClientConnection,
     peer_certs_cache: Option<Vec<Vec<u8>>>,
+    // Updated from IoState after processing, then reduced by plaintext reads.
+    plaintext_pending: usize,
 }
 
 /// Client-side TLS connection state machine.
@@ -58,6 +60,7 @@ impl RustlsClientConnection {
             inner: Mutex::new(ClientInner {
                 conn,
                 peer_certs_cache: None,
+                plaintext_pending: 0,
             }),
         }
     }
@@ -84,7 +87,8 @@ impl RustlsClientConnection {
         let inner = &self.inner;
         let result: Result<(), TlsError> = py.detach(|| {
             let mut guard = inner.lock().unwrap();
-            guard.conn.process_new_packets().map_err(TlsError::from)?;
+            let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
+            guard.plaintext_pending = state.plaintext_bytes_to_read();
             // Cache peer certs after handshake completes (while lock is held)
             if !guard.conn.is_handshaking() && guard.peer_certs_cache.is_none() {
                 guard.peer_certs_cache = guard
@@ -104,7 +108,9 @@ impl RustlsClientConnection {
         let mut buf = vec![0u8; max_len];
         let result: Result<usize, std::io::Error> = py.detach(|| {
             let mut guard = inner.lock().unwrap();
-            guard.conn.reader().read(&mut buf)
+            let n = guard.conn.reader().read(&mut buf)?;
+            guard.plaintext_pending = guard.plaintext_pending.saturating_sub(n);
+            Ok(n)
         });
         match result {
             Ok(n) => {
@@ -120,6 +126,12 @@ impl RustlsClientConnection {
             )),
             Err(e) => Err(error::raise_ssl_error(py, &format!("read error: {}", e))),
         }
+    }
+
+    /// Number of already decrypted bytes, without processing or consuming data.
+    fn pending(&self, py: Python<'_>) -> usize {
+        let inner = &self.inner;
+        py.detach(|| inner.lock().unwrap().plaintext_pending)
     }
 
     /// Write plaintext data to be encrypted by the TLS state machine.
@@ -322,7 +334,8 @@ impl RustlsClientConnection {
                 }
 
                 // Process buffered TLS records (the expensive crypto work)
-                guard.conn.process_new_packets().map_err(TlsError::from)?;
+                let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
+                guard.plaintext_pending = state.plaintext_bytes_to_read();
 
                 // Drain available plaintext
                 let remaining = max_plaintext - plaintext.len();
@@ -330,7 +343,10 @@ impl RustlsClientConnection {
                     let before = plaintext.len();
                     plaintext.resize(before + remaining, 0);
                     match guard.conn.reader().read(&mut plaintext[before..]) {
-                        Ok(n) => plaintext.truncate(before + n),
+                        Ok(n) => {
+                            guard.plaintext_pending = guard.plaintext_pending.saturating_sub(n);
+                            plaintext.truncate(before + n);
+                        }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             plaintext.truncate(before);
                         }
@@ -385,6 +401,8 @@ const TLS_V1_3: u16 = 0x0304;
 struct ServerInner {
     conn: ServerConnection,
     peer_certs_cache: Option<Vec<Vec<u8>>>,
+    // Updated from IoState after processing, then reduced by plaintext reads.
+    plaintext_pending: usize,
 }
 
 /// Server-side TLS connection state machine.
@@ -402,6 +420,7 @@ impl RustlsServerConnection {
             inner: Mutex::new(ServerInner {
                 conn,
                 peer_certs_cache: None,
+                plaintext_pending: 0,
             }),
         }
     }
@@ -423,7 +442,8 @@ impl RustlsServerConnection {
         let inner = &self.inner;
         let result: Result<(), TlsError> = py.detach(|| {
             let mut guard = inner.lock().unwrap();
-            guard.conn.process_new_packets().map_err(TlsError::from)?;
+            let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
+            guard.plaintext_pending = state.plaintext_bytes_to_read();
             if !guard.conn.is_handshaking() && guard.peer_certs_cache.is_none() {
                 guard.peer_certs_cache = guard
                     .conn
@@ -440,7 +460,9 @@ impl RustlsServerConnection {
         let mut buf = vec![0u8; max_len];
         let result: Result<usize, std::io::Error> = py.detach(|| {
             let mut guard = inner.lock().unwrap();
-            guard.conn.reader().read(&mut buf)
+            let n = guard.conn.reader().read(&mut buf)?;
+            guard.plaintext_pending = guard.plaintext_pending.saturating_sub(n);
+            Ok(n)
         });
         match result {
             Ok(n) => {
@@ -456,6 +478,12 @@ impl RustlsServerConnection {
             )),
             Err(e) => Err(error::raise_ssl_error(py, &format!("read error: {}", e))),
         }
+    }
+
+    /// Number of already decrypted bytes, without processing or consuming data.
+    fn pending(&self, py: Python<'_>) -> usize {
+        let inner = &self.inner;
+        py.detach(|| inner.lock().unwrap().plaintext_pending)
     }
 
     fn write_plaintext(&self, py: Python<'_>, data: &[u8]) -> PyResult<usize> {
@@ -619,14 +647,18 @@ impl RustlsServerConnection {
                     }
                 }
 
-                guard.conn.process_new_packets().map_err(TlsError::from)?;
+                let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
+                guard.plaintext_pending = state.plaintext_bytes_to_read();
 
                 let remaining = max_plaintext - plaintext.len();
                 if remaining > 0 {
                     let before = plaintext.len();
                     plaintext.resize(before + remaining, 0);
                     match guard.conn.reader().read(&mut plaintext[before..]) {
-                        Ok(n) => plaintext.truncate(before + n),
+                        Ok(n) => {
+                            guard.plaintext_pending = guard.plaintext_pending.saturating_sub(n);
+                            plaintext.truncate(before + n);
+                        }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             plaintext.truncate(before);
                         }

@@ -1,6 +1,13 @@
 Release History
 ===============
 
+2026.9.21
+---------
+
+- Fixed `pending()` method from SSLSocket. It is now aligned with stdlib ssl expected behavior.
+- Updated rustls v0.23.42 to v0.23.45
+- Updated aws-lc-rs v1.17.3 to v1.18.1
+
 2026.7.25
 ---------
 

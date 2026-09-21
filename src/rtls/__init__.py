@@ -150,7 +150,7 @@ from ._utils import (
     match_hostname,
 )
 
-__version__ = "2026.7.25"
+__version__ = "2026.9.21"
 
 __all__ = [
     # Classes

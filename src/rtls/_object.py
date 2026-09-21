@@ -362,9 +362,7 @@ class TLSObject:
 
     def pending(self) -> int:
         """Return the number of already decrypted bytes available for read."""
-        # Try to read 0 bytes to check; rustls doesn't expose this directly.
-        # Return incoming BIO pending as approximation.
-        return self._incoming.pending
+        return self._conn.pending()
 
     def get_channel_binding(self, cb_type: str = "tls-unique") -> bytes | None:
         """Return channel binding data. Not yet implemented."""

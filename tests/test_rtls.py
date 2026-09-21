@@ -808,6 +808,180 @@ class TestTLSObject(unittest.TestCase):
         self.assertFalse(obj.session_reused)
 
 
+class TestPending:
+    """Check plaintext availability for BIO and socket read paths."""
+
+    @pytest.fixture(params=[False, True], ids=["client", "server"])
+    def server_side(self, request):
+        return request.param
+
+    @pytest.fixture(params=["TLSv1_2", "TLSv1_3"])
+    def version(self, request):
+        return request.param
+
+    @pytest.fixture
+    def make_pair(self, server_side, version):
+        """Connect the implementation under test to a stdlib peer using BIOs."""
+
+        def create(api):
+            endpoints = []
+            for is_server in (False, True):
+                module = api if is_server == server_side else _stdlib_ssl
+                protocol = (
+                    module.PROTOCOL_TLS_SERVER
+                    if is_server
+                    else module.PROTOCOL_TLS_CLIENT
+                )
+                context = module.SSLContext(protocol)
+                context.check_hostname = False
+                context.verify_mode = module.CERT_NONE
+                context.minimum_version = context.maximum_version = getattr(
+                    module.TLSVersion, version
+                )
+                if is_server:
+                    context.load_cert_chain(
+                        os.path.join(
+                            os.path.dirname(__file__), "certdata", "keycert.pem"
+                        )
+                    )
+                incoming, outgoing = module.MemoryBIO(), module.MemoryBIO()
+                obj = context.wrap_bio(
+                    incoming,
+                    outgoing,
+                    server_side=is_server,
+                    server_hostname=None if is_server else "localhost",
+                )
+                assert obj.pending() == 0
+                endpoints.append((obj, incoming, outgoing, module))
+
+            complete = [False, False]
+            for _ in range(20):
+                for index, (obj, incoming, outgoing, module) in enumerate(endpoints):
+                    try:
+                        obj.do_handshake()
+                        complete[index] = True
+                    except module.SSLWantReadError:
+                        pass
+                    if outgoing.pending:
+                        endpoints[1 - index][1].write(outgoing.read())
+                if all(complete):
+                    break
+            assert all(complete), "BIO handshake did not complete"
+
+            # Process any TLS 1.3 session tickets left by the handshake.
+            for obj, incoming, outgoing, module in endpoints:
+                with pytest.raises(module.SSLWantReadError):
+                    obj.read(1)
+                assert incoming.pending == obj.pending() == 0
+
+            receiver, incoming, _, _ = endpoints[int(server_side)]
+            peer, _, outgoing, _ = endpoints[int(not server_side)]
+            return receiver, incoming, peer, outgoing
+
+        return create
+
+    @pytest.mark.parametrize("api", [_stdlib_ssl, ssl], ids=["stdlib", "rtls"])
+    def test_pending_counts_plaintext_without_consuming_it(self, make_pair, api):
+        receiver, incoming, peer, outgoing = make_pair(api)
+        peer.write(b"hello")
+        ciphertext = outgoing.read()
+        incoming.write(ciphertext)
+
+        assert receiver.pending() == receiver.pending() == 0
+        assert incoming.pending == len(ciphertext)
+        assert receiver.read(1) == b"h"
+        assert incoming.pending == 0
+        assert receiver.pending() == receiver.pending() == 4
+        assert receiver.read(2) == b"el"
+        assert receiver.pending() == 2
+        assert receiver.read(2) == b"lo"
+        assert receiver.pending() == 0
+        with pytest.raises(api.SSLWantReadError):
+            receiver.read(1)
+        assert receiver.pending() == 0
+
+    @pytest.mark.parametrize("api", [_stdlib_ssl, ssl], ids=["stdlib", "rtls"])
+    def test_pending_excludes_fragmented_records(self, make_pair, api):
+        receiver, incoming, peer, outgoing = make_pair(api)
+        peer.write(b"hello")
+        ciphertext = outgoing.read()
+        incoming.write(ciphertext[:1])
+
+        assert receiver.pending() == 0
+        with pytest.raises(api.SSLWantReadError):
+            receiver.read(1)
+        assert receiver.pending() == 0
+
+        incoming.write(ciphertext[1:])
+        assert receiver.pending() == 0
+        assert receiver.read(1) == b"h"
+        assert receiver.pending() == 4
+        assert receiver.read(4) == b"ello"
+        assert receiver.pending() == 0
+
+    @pytest.mark.parametrize("api", [_stdlib_ssl, ssl], ids=["stdlib", "rtls"])
+    def test_pending_after_read_into_buffer(self, make_pair, api):
+        receiver, incoming, peer, outgoing = make_pair(api)
+        peer.write(b"hello")
+        incoming.write(outgoing.read())
+        buffer = bytearray(2)
+
+        assert receiver.read(2, buffer) == 2
+        assert buffer == b"he"
+        assert receiver.pending() == 3
+        assert receiver.read(2, buffer) == 2
+        assert buffer == b"ll"
+        assert receiver.pending() == 1
+        assert receiver.read(1) == b"o"
+        assert receiver.pending() == 0
+
+    def test_pending_after_explicit_packet_processing(self, make_pair):
+        receiver, incoming, peer, outgoing = make_pair(ssl)
+        peer.write(b"hello")
+        ciphertext = outgoing.read()
+        assert receiver._conn.read_tls(ciphertext) == len(ciphertext)
+        # Even ciphertext buffered inside rustls must not count as plaintext.
+        assert receiver.pending() == 0
+        receiver._conn.process_new_packets()
+        assert incoming.pending == 0
+        assert receiver.pending() == 5
+        receiver._conn.process_new_packets()
+        assert receiver.pending() == 5
+        assert receiver.read(2) == b"he"
+        assert receiver.pending() == 3
+        assert receiver.read(3) == b"llo"
+        assert receiver.pending() == 0
+
+    def test_pending_after_socket_decrypt_path(self, make_pair):
+        receiver, incoming, peer, outgoing = make_pair(ssl)
+        peer.write(b"hello")
+
+        assert receiver.feed_decrypt(outgoing.read(), 1) == b"h"
+        assert incoming.pending == 0
+        assert receiver.pending() == receiver.pending() == 4
+        assert receiver.feed_decrypt(b"", 2) == b"el"
+        assert receiver.pending() == 2
+        assert receiver.feed_decrypt(b"", 2) == b"lo"
+        assert receiver.pending() == 0
+
+    def test_pending_across_multiple_decrypted_records(self, make_pair):
+        receiver, incoming, peer, outgoing = make_pair(ssl)
+        peer.write(b"hello")
+        peer.write(b"world")
+        incoming.write(outgoing.read())
+
+        assert receiver.read(1) == b"h"
+        assert receiver.pending() == 9
+        # Processing more records must retain the count of unread plaintext.
+        peer.write(b"again")
+        incoming.write(outgoing.read())
+        assert receiver.pending() == 9
+        assert receiver.read(2) == b"el"
+        assert receiver.pending() == 12
+        assert receiver.read(12) == b"loworldagain"
+        assert receiver.pending() == 0
+
+
 class TestTLSCertificate(unittest.TestCase):
     """TLSCertificate wrapper tests."""
 
