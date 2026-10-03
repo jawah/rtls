@@ -80,7 +80,7 @@ jobs:
         run: |
           curl -fL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz -o /tmp/wasi-sdk.tar.gz
           tar -xf /tmp/wasi-sdk.tar.gz -C /tmp
-          rustup toolchain install 1.97.0 --profile minimal --target wasm32-wasip1
+          rustup toolchain install 1.98.0 --profile minimal --target wasm32-wasip1
       - name: Build WASI extension sidecar
         env:
           PYO3_NO_PYTHON: 1
@@ -96,7 +96,7 @@ jobs:
             -C link-arg=-Wl,--allow-undefined
             -C relocation-model=pic
         run: |
-          cargo +1.97.0 build --manifest-path rust/Cargo.toml --target wasm32-wasip1 --release
+          cargo +1.98.0 build --manifest-path rust/Cargo.toml --target wasm32-wasip1 --release
           mkdir -p dist
           cp rust/target/wasm32-wasip1/release/_rustls.wasm dist/_rustls.abi3.so
           sha256sum dist/_rustls.abi3.so

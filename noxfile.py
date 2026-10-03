@@ -94,7 +94,7 @@ ROOT = Path(__file__).parent.resolve()
 WASI_SDK_VERSION = "33.0"
 COMPONENTIZE_PY_VERSION = "0.25.0"
 WASMTIME_VERSION = "47.0.1"
-WASI_RUST_VERSION = "1.97.0"
+WASI_RUST_VERSION = "1.98.0"
 
 
 @nox.session(python="3.12")
