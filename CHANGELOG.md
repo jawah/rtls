@@ -1,6 +1,11 @@
 Release History
 ===============
 
+2026.10.3
+---------
+
+- Fixed EOF handling with MemoryBIO to align ourselves with stdlib behavior.
+
 2026.9.21
 ---------
 

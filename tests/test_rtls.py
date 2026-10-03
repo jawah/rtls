@@ -808,8 +808,8 @@ class TestTLSObject(unittest.TestCase):
         self.assertFalse(obj.session_reused)
 
 
-class TestPending:
-    """Check plaintext availability for BIO and socket read paths."""
+class _BIOPairTests:
+    """BIO connections against a stdlib peer, in both roles and TLS versions."""
 
     @pytest.fixture(params=[False, True], ids=["client", "server"])
     def server_side(self, request):
@@ -879,6 +879,10 @@ class TestPending:
             return receiver, incoming, peer, outgoing
 
         return create
+
+
+class TestPending(_BIOPairTests):
+    """Check plaintext availability for BIO and socket read paths."""
 
     @pytest.mark.parametrize("api", [_stdlib_ssl, ssl], ids=["stdlib", "rtls"])
     def test_pending_counts_plaintext_without_consuming_it(self, make_pair, api):
@@ -980,6 +984,233 @@ class TestPending:
         assert receiver.pending() == 12
         assert receiver.read(12) == b"loworldagain"
         assert receiver.pending() == 0
+
+
+class TestCleanEOF(_BIOPairTests):
+    @staticmethod
+    def _close_notify(peer, outgoing, payload=b""):
+        if payload:
+            peer.write(payload)
+        with pytest.raises(_stdlib_ssl.SSLWantReadError):
+            peer.unwrap()
+        return outgoing.read()
+
+    @pytest.mark.parametrize("api", [_stdlib_ssl, ssl], ids=["stdlib", "rtls"])
+    @pytest.mark.parametrize("payload", [b"", b"abcd", b"abcdefghij"])
+    @pytest.mark.parametrize("buffered", [False, True])
+    def test_bio_clean_eof(self, make_pair, api, payload, buffered):
+        receiver, incoming, peer, outgoing = make_pair(api)
+        incoming.write(self._close_notify(peer, outgoing, payload))
+        buffer = bytearray(4)
+
+        def read():
+            if buffered:
+                count = receiver.read(4, buffer)
+                return bytes(buffer[:count])
+            return receiver.read(4)
+
+        received = bytearray()
+        while len(received) < len(payload):
+            data = read()
+            assert data
+            received.extend(data)
+        assert received == payload
+        for _ in range(2):
+            if buffered:
+                assert receiver.read(4, buffer) == 0
+            else:
+                assert read() == b""
+        assert receiver.pending() == 0
+        # A later TCP EOF must not turn an orderly TLS EOF into SSLEOFError.
+        incoming.write_eof()
+        assert read() == b""
+        if api is ssl:
+            assert not receiver._shutdown
+
+    @pytest.mark.parametrize("split", [1, -1])
+    def test_split_records_before_clean_eof(self, make_pair, split):
+        receiver, incoming, peer, outgoing = make_pair(ssl)
+        payload = b"abcdefghij"
+        ciphertext = self._close_notify(peer, outgoing, payload)
+        incoming.write(ciphertext[:split])
+        received = bytearray()
+        while True:
+            try:
+                data = receiver.read(4)
+            except SSLWantReadError:
+                break
+            assert data, "EOF before the entire close_notify arrived"
+            received.extend(data)
+        incoming.write(ciphertext[split:])
+        while len(received) < len(payload):
+            data = receiver.read(4)
+            assert data
+            received.extend(data)
+        assert received == payload
+        assert receiver.read(4) == receiver.read(4) == b""
+
+    @pytest.mark.parametrize("fused", [False, True])
+    @pytest.mark.parametrize("payload", [b"", b"abcd", b"abcdefghij"])
+    def test_native_clean_eof(self, make_pair, fused, payload):
+        receiver, _, peer, outgoing = make_pair(ssl)
+        conn = receiver._conn
+        # No close_notify: empty plaintext still means WANT_READ to the wrapper.
+        assert conn.read_plaintext(4) == b""
+        assert conn.decrypt_incoming(b"", 4) == (b"", b"")
+        ciphertext = self._close_notify(peer, outgoing, payload)
+        received = bytearray()
+        if fused:
+            try:
+                data, unconsumed = conn.decrypt_incoming(ciphertext, 4)
+                assert not unconsumed
+                received.extend(data)
+            except SSLZeroReturnError:
+                assert not payload
+        else:
+            assert conn.read_tls(ciphertext) == len(ciphertext)
+            conn.process_new_packets()
+        while len(received) < len(payload):
+            data = conn.read_plaintext(4)
+            assert data
+            received.extend(data)
+        assert received == payload
+        assert conn.pending() == 0
+        for _ in range(2):
+            with pytest.raises(SSLZeroReturnError):
+                conn.read_plaintext(4)
+            with pytest.raises(SSLZeroReturnError):
+                conn.decrypt_incoming(b"", 4)
+        assert conn.read_tls(b"") == 0
+        conn.process_new_packets()
+        with pytest.raises(SSLZeroReturnError):
+            conn.read_plaintext(4)
+        # A zero-length read must not invent EOF or consume plaintext.
+        assert conn.read_plaintext(0) == b""
+        assert conn.decrypt_incoming(b"", 0) == (b"", b"")
+
+    @pytest.mark.parametrize("payload", [b"", b"abcd", b"abcdefghij"])
+    def test_stream_socket_eof_without_more_transport_reads(self, make_pair, payload):
+        from unittest.mock import Mock
+
+        receiver, incoming, peer, outgoing = make_pair(ssl)
+        transport = Mock()
+        transport.recv.side_effect = [
+            self._close_notify(peer, outgoing, payload),
+            AssertionError("read transport after receiving close_notify"),
+        ]
+        stream = TLSStreamSocket.__new__(TLSStreamSocket)
+        stream._transport = transport
+        stream._sslobj_internal = receiver
+        stream._suppress_ragged_eofs = False
+        received = bytearray()
+        while len(received) < len(payload):
+            data = stream.recv(4)
+            assert data
+            received.extend(data)
+        assert received == payload
+        assert stream.recv(4) == stream.recv(4) == b""
+        assert stream.recv_into(bytearray(4)) == 0
+        assert stream.pending() == 0
+        assert not receiver._shutdown
+        assert transport.recv.call_count == 1
+
+    def test_live_and_unclean_eof(self, make_pair):
+        receiver, incoming, _, _ = make_pair(ssl)
+        with pytest.raises(SSLWantReadError):
+            receiver.read(4)
+        assert receiver.feed_decrypt(b"", 4) == b""
+        incoming.write_eof()
+        with pytest.raises(SSLEOFError):
+            receiver.read(4)
+
+
+class TestCleanEOFSockets:
+    @pytest.fixture(params=["TLSv1_2", "TLSv1_3"])
+    def closing_peer(self, request):
+        import threading
+
+        context = _stdlib_ssl.SSLContext(_stdlib_ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = context.maximum_version = getattr(
+            _stdlib_ssl.TLSVersion, request.param
+        )
+        context.load_cert_chain(
+            os.path.join(os.path.dirname(__file__), "certdata", "keycert.pem")
+        )
+        close_tls, stop = threading.Event(), threading.Event()
+        errors = []
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(5)
+
+        def serve():
+            try:
+                with listener.accept()[0] as raw:
+                    raw.settimeout(5)
+                    incoming, outgoing = (
+                        _stdlib_ssl.MemoryBIO(),
+                        _stdlib_ssl.MemoryBIO(),
+                    )
+                    peer = context.wrap_bio(incoming, outgoing, server_side=True)
+                    while True:
+                        try:
+                            peer.do_handshake()
+                            break
+                        except _stdlib_ssl.SSLWantReadError:
+                            raw.sendall(outgoing.read())
+                            data = raw.recv(65536)
+                            assert data
+                            incoming.write(data)
+                    raw.sendall(outgoing.read())
+                    peer.write(b"ok")
+                    raw.sendall(outgoing.read())
+                    assert close_tls.wait(5)
+                    with pytest.raises(_stdlib_ssl.SSLWantReadError):
+                        peer.unwrap()
+                    raw.sendall(outgoing.read())
+                    # Only test cleanup can close TCP; a FIN cannot hide TLS EOF.
+                    stop.wait()
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            yield listener.getsockname(), close_tls
+        finally:
+            close_tls.set()
+            stop.set()
+            thread.join(6)
+            listener.close()
+            assert not thread.is_alive()
+            assert not errors, errors
+
+    def test_socket_clean_eof_while_tcp_stays_open(self, closing_peer):
+        address, close_tls = closing_peer
+        with socket.create_connection(address, timeout=1) as raw:
+            with _make_ctx().wrap_socket(raw, server_hostname="localhost") as client:
+                assert client.recv(2) == b"ok"
+                close_tls.set()
+                assert client.recv(1) == client.recv(1) == b""
+                assert client.recv_into(bytearray(4)) == 0
+
+    def test_asyncio_clean_eof_while_tcp_stays_open(self, closing_peer):
+        address, close_tls = closing_peer
+
+        async def run():
+            reader, writer = await asyncio.open_connection(
+                *address, ssl=_make_ctx(), server_hostname="localhost"
+            )
+            try:
+                assert await asyncio.wait_for(reader.readexactly(2), 1) == b"ok"
+                close_tls.set()
+                for _ in range(2):
+                    assert await asyncio.wait_for(reader.read(1), 1) == b""
+            finally:
+                writer.transport.abort()
+                await asyncio.wait_for(writer.wait_closed(), 1)
+
+        asyncio.run(run())
 
 
 class TestTLSCertificate(unittest.TestCase):

@@ -34,6 +34,17 @@ pub fn raise_eof(py: Python<'_>, msg: &str) -> PyErr {
     get_exc_type(py, "rtls._exceptions", "SSLEOFError", "SSL: EOF - ", msg)
 }
 
+/// Signal a received close_notify after all application plaintext is drained.
+pub fn raise_zero_return(py: Python<'_>) -> PyErr {
+    get_exc_type(
+        py,
+        "rtls._exceptions",
+        "SSLZeroReturnError",
+        "SSL: ",
+        "TLS/SSL connection has been closed by the peer",
+    )
+}
+
 /// Raise SSLCertVerificationError on the Python side.
 pub fn raise_cert_verification(py: Python<'_>, msg: &str) -> PyErr {
     get_exc_type(

@@ -66,6 +66,8 @@ class TLSObject:
         self._conn: Any = None  # RustlsClientConnection or RustlsServerConnection
         self._handshake_done = False
         self._shutdown = False
+        # Set only once the peer's close_notify and all plaintext are consumed.
+        self._peer_closed = False
 
         self._pending_ct: bytes = b""
         self._maybe_buffered = False
@@ -171,6 +173,8 @@ class TLSObject:
         """
         if self._shutdown:
             raise SSLZeroReturnError("TLS/SSL connection has been closed")
+        if self._peer_closed:
+            return 0 if buffer is not None else b""
 
         max_len = n if n > 0 else 65536
 
@@ -179,7 +183,11 @@ class TLSObject:
 
         if ciphertext:
             # Fast path: one Rust call does everything
-            plaintext, unconsumed = self._conn.decrypt_incoming(ciphertext, max_len)
+            try:
+                plaintext, unconsumed = self._conn.decrypt_incoming(ciphertext, max_len)
+            except SSLZeroReturnError:
+                self._peer_closed = True
+                return 0 if buffer is not None else b""
 
             # Stash any unconsumed ciphertext back in the BIO
             if unconsumed:
@@ -198,7 +206,11 @@ class TLSObject:
         # No ciphertext available (or it produced no plaintext).
         # Try draining any plaintext already buffered in rustls from
         # a previous decrypt_incoming call that hit max_len.
-        data = self._conn.read_plaintext(max_len)
+        try:
+            data = self._conn.read_plaintext(max_len)
+        except SSLZeroReturnError:
+            self._peer_closed = True
+            return 0 if buffer is not None else b""
         if data:
             if buffer is not None:
                 nbytes = min(len(data), len(buffer))
@@ -214,12 +226,12 @@ class TLSObject:
         )
 
     def has_pending(self) -> bool:
-        """True if plaintext may be available without reading the network.``."""
-        return bool(self._pending_ct) or self._maybe_buffered
+        """True if plaintext or clean EOF may be available without network I/O."""
+        return self._peer_closed or bool(self._pending_ct) or self._maybe_buffered
 
     def feed_decrypt(self, ciphertext: bytes, max_len: int) -> bytes:
         """Synchronous fast-path read used by :class:`TLSSocket`."""
-        if self._shutdown:
+        if self._shutdown or self._peer_closed:
             raise SSLZeroReturnError("TLS/SSL connection has been closed")
 
         # Absorb any ciphertext left in the incoming BIO
@@ -232,16 +244,25 @@ class TLSObject:
             self._pending_ct = b""
 
         if ciphertext:
-            plaintext, unconsumed = self._conn.decrypt_incoming(ciphertext, max_len)
+            try:
+                plaintext, unconsumed = self._conn.decrypt_incoming(ciphertext, max_len)
+            except SSLZeroReturnError:
+                self._peer_closed = True
+                raise
             self._pending_ct = unconsumed
             # Flush any control messages rustls produced (key updates, etc).
             self._flush_outgoing()
-            self._maybe_buffered = bool(unconsumed) or len(plaintext) >= max_len
+            # Even a short read can leave a received close_notify to report.
+            self._maybe_buffered = bool(unconsumed) or bool(plaintext)
             return plaintext
 
         # drain already decrypted.
-        plaintext = self._conn.read_plaintext(max_len)
-        self._maybe_buffered = len(plaintext) >= max_len
+        try:
+            plaintext = self._conn.read_plaintext(max_len)
+        except SSLZeroReturnError:
+            self._peer_closed = True
+            raise
+        self._maybe_buffered = bool(plaintext)
         return plaintext
 
     def write(self, data: bytes | bytearray | memoryview) -> int:

@@ -205,8 +205,7 @@ class TLSSocket(_stdlib_ssl.SSLSocket):
 
         while True:
             # 1. Drain plaintext rustls already holds, without touching the
-            #    network (post-handshake leftover, or data buffered because
-            #    a previous decrypt filled the caller's buffer).
+            #    network, including a close_notify after the last data read.
             if obj.has_pending() or obj._incoming.pending:
                 try:
                     data = obj.feed_decrypt(b"", buflen)

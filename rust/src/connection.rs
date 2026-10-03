@@ -13,6 +13,7 @@ use crate::error;
 enum TlsError {
     CertVerification(String),
     General(String),
+    CleanEof,
 }
 
 impl From<rustls::Error> for TlsError {
@@ -32,6 +33,7 @@ impl TlsError {
         match self {
             TlsError::CertVerification(msg) => error::raise_cert_verification(py, &msg),
             TlsError::General(msg) => error::raise_ssl_error(py, &msg),
+            TlsError::CleanEof => error::raise_zero_return(py),
         }
     }
 }
@@ -42,6 +44,8 @@ struct ClientInner {
     peer_certs_cache: Option<Vec<Vec<u8>>>,
     // Updated from IoState after processing, then reduced by plaintext reads.
     plaintext_pending: usize,
+    // Received close_notify is sticky and independent of local shutdown.
+    peer_has_closed: bool,
 }
 
 /// Client-side TLS connection state machine.
@@ -61,6 +65,7 @@ impl RustlsClientConnection {
                 conn,
                 peer_certs_cache: None,
                 plaintext_pending: 0,
+                peer_has_closed: false,
             }),
         }
     }
@@ -89,6 +94,7 @@ impl RustlsClientConnection {
             let mut guard = inner.lock().unwrap();
             let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
             guard.plaintext_pending = state.plaintext_bytes_to_read();
+            guard.peer_has_closed |= state.peer_has_closed();
             // Cache peer certs after handshake completes (while lock is held)
             if !guard.conn.is_handshaking() && guard.peer_certs_cache.is_none() {
                 guard.peer_certs_cache = guard
@@ -102,18 +108,20 @@ impl RustlsClientConnection {
     }
 
     /// Read decrypted plaintext from the TLS state machine.
-    /// Returns bytes. Returns empty bytes if no data available.
+    /// Returns empty bytes for WouldBlock; raises SSLZeroReturnError only
+    /// after receiving close_notify and draining all application plaintext.
     fn read_plaintext(&self, py: Python<'_>, max_len: usize) -> PyResult<Py<PyAny>> {
         let inner = &self.inner;
         let mut buf = vec![0u8; max_len];
-        let result: Result<usize, std::io::Error> = py.detach(|| {
+        let result: Result<(usize, bool), std::io::Error> = py.detach(|| {
             let mut guard = inner.lock().unwrap();
             let n = guard.conn.reader().read(&mut buf)?;
             guard.plaintext_pending = guard.plaintext_pending.saturating_sub(n);
-            Ok(n)
+            Ok((n, guard.peer_has_closed))
         });
         match result {
-            Ok(n) => {
+            Ok((0, true)) if max_len > 0 => Err(error::raise_zero_return(py)),
+            Ok((n, _)) => {
                 buf.truncate(n);
                 Ok(PyBytes::new(py, &buf).into())
             }
@@ -299,6 +307,7 @@ impl RustlsClientConnection {
     /// read_tls → process → drain until all input is consumed.
     ///
     /// Returns `(plaintext_bytes, unconsumed_ciphertext_bytes)`.
+    /// Raises SSLZeroReturnError only after received clean EOF is drained.
     /// `unconsumed` will be non-empty only if we filled `max_plaintext`
     /// before exhausting the input — the caller should stash it back.
     fn decrypt_incoming(
@@ -336,6 +345,7 @@ impl RustlsClientConnection {
                 // Process buffered TLS records (the expensive crypto work)
                 let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
                 guard.plaintext_pending = state.plaintext_bytes_to_read();
+                guard.peer_has_closed |= state.peer_has_closed();
 
                 // Drain available plaintext
                 let remaining = max_plaintext - plaintext.len();
@@ -367,7 +377,7 @@ impl RustlsClientConnection {
                 }
 
                 // If all ciphertext consumed and nothing left to process, done
-                if offset >= total {
+                if offset >= total || guard.peer_has_closed {
                     break;
                 }
             }
@@ -380,6 +390,12 @@ impl RustlsClientConnection {
                     .map(|certs| certs.iter().map(|c| c.to_vec()).collect());
             }
 
+            // Empty plaintext alone is not EOF: a live connection may need
+            // more ciphertext. Only signal clean EOF after close_notify and
+            // after returning all buffered application data to the caller.
+            if plaintext.is_empty() && max_plaintext > 0 && guard.peer_has_closed {
+                return Err(TlsError::CleanEof);
+            }
             Ok((plaintext, offset))
         });
 
@@ -403,6 +419,8 @@ struct ServerInner {
     peer_certs_cache: Option<Vec<Vec<u8>>>,
     // Updated from IoState after processing, then reduced by plaintext reads.
     plaintext_pending: usize,
+    // Received close_notify is sticky and independent of local shutdown.
+    peer_has_closed: bool,
 }
 
 /// Server-side TLS connection state machine.
@@ -421,6 +439,7 @@ impl RustlsServerConnection {
                 conn,
                 peer_certs_cache: None,
                 plaintext_pending: 0,
+                peer_has_closed: false,
             }),
         }
     }
@@ -444,6 +463,7 @@ impl RustlsServerConnection {
             let mut guard = inner.lock().unwrap();
             let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
             guard.plaintext_pending = state.plaintext_bytes_to_read();
+            guard.peer_has_closed |= state.peer_has_closed();
             if !guard.conn.is_handshaking() && guard.peer_certs_cache.is_none() {
                 guard.peer_certs_cache = guard
                     .conn
@@ -458,14 +478,15 @@ impl RustlsServerConnection {
     fn read_plaintext(&self, py: Python<'_>, max_len: usize) -> PyResult<Py<PyAny>> {
         let inner = &self.inner;
         let mut buf = vec![0u8; max_len];
-        let result: Result<usize, std::io::Error> = py.detach(|| {
+        let result: Result<(usize, bool), std::io::Error> = py.detach(|| {
             let mut guard = inner.lock().unwrap();
             let n = guard.conn.reader().read(&mut buf)?;
             guard.plaintext_pending = guard.plaintext_pending.saturating_sub(n);
-            Ok(n)
+            Ok((n, guard.peer_has_closed))
         });
         match result {
-            Ok(n) => {
+            Ok((0, true)) if max_len > 0 => Err(error::raise_zero_return(py)),
+            Ok((n, _)) => {
                 buf.truncate(n);
                 Ok(PyBytes::new(py, &buf).into())
             }
@@ -649,6 +670,7 @@ impl RustlsServerConnection {
 
                 let state = guard.conn.process_new_packets().map_err(TlsError::from)?;
                 guard.plaintext_pending = state.plaintext_bytes_to_read();
+                guard.peer_has_closed |= state.peer_has_closed();
 
                 let remaining = max_plaintext - plaintext.len();
                 if remaining > 0 {
@@ -676,7 +698,7 @@ impl RustlsServerConnection {
                     break;
                 }
 
-                if offset >= total {
+                if offset >= total || guard.peer_has_closed {
                     break;
                 }
             }
@@ -689,6 +711,12 @@ impl RustlsServerConnection {
                     .map(|certs| certs.iter().map(|c| c.to_vec()).collect());
             }
 
+            // Empty plaintext alone is not EOF: a live connection may need
+            // more ciphertext. Only signal clean EOF after close_notify and
+            // after returning all buffered application data to the caller.
+            if plaintext.is_empty() && max_plaintext > 0 && guard.peer_has_closed {
+                return Err(TlsError::CleanEof);
+            }
             Ok((plaintext, offset))
         });
 
